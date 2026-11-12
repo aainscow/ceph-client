@@ -2245,11 +2245,58 @@ static void migration_linger_test(struct kunit *test)
 }
 
 /*
- * Not fixed yet: a split read cancelled and released by its owner while
- * its sub-reads are out, as ceph_osdc_wait_request() leaves one when
- * interrupted.  ec_split_finish() reads the parent's r_osdc before it
- * checks for the cancellation, after the parent is gone (KASAN:
- * slab-use-after-free in ec_split_sub_cb()).
+ * A single-chunk direct read redirected to a replicated pool by a pool
+ * migration goes to the primary there, as a plain read: OSDs fail EC
+ * direct reads on pools without EC optimizations with -EOPNOTSUPP.
+ */
+static void direct_read_migration_redirect_test(struct kunit *test)
+{
+	struct test_osdmap *tm = ceph_kunit_osdmap_dup(test, &client_map);
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_request *reqs[2], *req;
+	struct ceph_hobject_id hoids[2];
+	struct ceph_osds acting;
+	struct ceph_pg pgid;
+	char names[2][16];
+	u32 seed;
+	int i;
+
+	KUNIT_ASSERT_EQ(test, test_pg_objects(osdc, TEST_POOL_EC, names, 2,
+					      &seed), 2);
+	tm->pools[1].migration_target = TEST_POOL_DST;
+	tm->pools[1].num_migrating_pgs = 1;
+	tm->pools[1].migrating_pgs[0] = seed;
+	tm->pools[3].migration_src = TEST_POOL_EC;
+	tm->pools[3].migration_root = TEST_POOL_EC;
+	test_apply_map(test, osdc, tm);
+
+	test_acting(osdc, TEST_POOL_EC, names[0], &pgid, &acting);
+	for (i = 0; i < 2; i++) {
+		reqs[i] = test_read(test, osdc, TEST_POOL_EC, names[i],
+				    CEPH_OSD_OP_READ, TEST_CHUNK, 1000,
+				    CEPH_OSD_FLAG_BALANCE_READS);
+		ceph_osdc_start_request(osdc, reqs[i]);
+		KUNIT_ASSERT_EQ(test, test_osd(reqs[i]), acting.osds[1]);
+		hoid_fill_from_target(&hoids[i], &reqs[i]->r_t);
+	}
+
+	/* the shard redirects the object that sorts first */
+	i = hoid_compare(&hoids[0], &hoids[1]) > 0;
+	req = reqs[i];
+	test_reply(test, req, -ENOENT, NULL, NULL, &hoids[!i]);
+	test_acting(osdc, TEST_POOL_DST, names[i], &pgid, &acting);
+	KUNIT_EXPECT_EQ(test, req->r_t.target_oloc.pool, TEST_POOL_DST);
+	KUNIT_EXPECT_FALSE(test, req->r_flags & CEPH_OSD_FLAG_EC_DIRECT_READ);
+	KUNIT_EXPECT_EQ(test, test_osd(req), acting.primary);
+
+	for (i = 0; i < 2; i++)
+		test_put(test, reqs[i]);
+}
+
+/*
+ * A split read cancelled and released by its owner while its sub-reads
+ * are out, as ceph_osdc_wait_request() leaves one when interrupted: the
+ * sub-reads complete without touching the parent (KASAN).
  */
 static void split_read_cancel_release_test(struct kunit *test)
 {
@@ -2284,14 +2331,11 @@ static void test_pg_not_0(struct ceph_osd_client *osdc, s64 pool, char *name,
 }
 
 /*
- * Not fixed yet: calc_target() keeps whether the object's PG is migrating
- * as found for last_pgid, which is PG 0 on a target's first calculation,
- * since t->pg_num is 0 then.  Objecter keeps the migrating PGs and asks the
- * old and the new set about the same PG (PastIntervals::is_new_interval()).
- * So with PG 0 not migrating and the object's PG migrating, the next
- * calculation that checks for a new interval finds one: a single-chunk
- * direct read goes to the primary as it is submitted (calc_target() runs
- * twice then), and a watch is resent on an unrelated map change.
+ * Whether the object's PG is migrating is kept for that PG, not for
+ * last_pgid, which is PG 0 on a target's first calculation.  Otherwise,
+ * with PG 0 not migrating and the object's PG migrating, a single-chunk
+ * direct read would go to the primary as it is submitted (calc_target()
+ * runs twice then), and a watch would be resent on an unrelated map change.
  */
 static void pg_migrating_first_calc_test(struct kunit *test)
 {
@@ -2403,6 +2447,7 @@ static struct kunit_suite ceph_osd_client_reply_test_suite = {
 static struct kunit_case ceph_osd_client_migration_test_cases[] = {
 	KUNIT_CASE(migration_redirect_test),
 	KUNIT_CASE(migration_linger_test),
+	KUNIT_CASE(direct_read_migration_redirect_test),
 	KUNIT_CASE(pg_migrating_first_calc_test),
 	{}
 };
