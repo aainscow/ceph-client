@@ -3332,13 +3332,16 @@ static bool ec_split_sub_ok(struct ceph_osd_request *sreq)
 static void ec_split_finish(struct ceph_ec_split *sp)
 {
 	struct ceph_osd_request *req = sp->req;
-	struct ceph_osd_client *osdc = req->r_osdc;
+	struct ceph_osd_client *osdc;
 	int i, ok = 0, enoent = 0;
 	bool opnotsupp = false;
 
+	/* a cancelled read may have been freed already */
 	if (atomic_cmpxchg(&sp->state, EC_SPLIT_RUNNING,
 			   EC_SPLIT_FINISHING) != EC_SPLIT_RUNNING)
-		goto out;	/* cancelled */
+		goto out;
+
+	osdc = req->r_osdc;
 
 	for (i = 0; i < sp->num_subs; i++) {
 		struct ceph_osd_request *sreq = sp->subs[i].req;
