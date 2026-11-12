@@ -1900,7 +1900,10 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 	last_pgid.pool = pgid.pool;
 	last_pgid.seed = ceph_stable_mod(pgid.seed, t->pg_num, t->pg_num_mask);
 	ec_optimizations = pi->flags & CEPH_POOL_FLAG_EC_OPTIMIZATIONS;
-	pg_migrating = is_pg_migrating(pi, last_pgid.seed);
+	/* the object's PG in this map: last_pgid is PG 0 at first */
+	pg_migrating = is_pg_migrating(pi, ceph_stable_mod(pgid.seed,
+							   pi->pg_num,
+							   pi->pg_num_mask));
 	pool_pgs_migrating = pi->num_migrating_pgs;
 
 	ceph_pg_to_up_acting_osds(osdc->osdmap, pi, &pgid, &up, &acting);
