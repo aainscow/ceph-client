@@ -123,14 +123,65 @@ static void ec_direct_read_shard_test(struct kunit *test)
 			-1);
 }
 
+/* ec_shard_bytes() the slow way: byte by byte */
+static u64 test_shard_bytes(u64 off, u64 len, u32 chunk, u32 k, u32 raw)
+{
+	u64 b, n = 0;
+
+	for (b = off; b < off + len; b++) {
+		u64 c = div_u64(b, chunk);
+
+		if (do_div(c, k) == raw)
+			n++;
+	}
+	return n;
+}
+
+/* Every range within three stripes of a layout, for data shard @raw. */
+static void test_shard_bytes_layout(struct kunit *test, u32 chunk, u32 k,
+				    u32 raw)
+{
+	u64 span = 3ULL * chunk * k, off, len, got, want;
+
+	for (off = 0; off <= span; off++) {
+		for (len = 0; off + len <= span; len++) {
+			got = ec_shard_bytes(off, len, chunk, k, raw);
+			want = test_shard_bytes(off, len, chunk, k, raw);
+			KUNIT_EXPECT_EQ_MSG(test, got, want,
+					    "chunk %u k %u raw %u %llu~%llu",
+					    chunk, k, raw, off, len);
+		}
+	}
+}
+
 static void ec_shard_bytes_test(struct kunit *test)
 {
+	u32 chunk, k, raw;
+	u64 off;
+
 	KUNIT_EXPECT_EQ(test, ec_shard_bytes(0, 8192, 4096, 2, 0), 4096);
 	KUNIT_EXPECT_EQ(test, ec_shard_bytes(0, 8192, 4096, 2, 1), 4096);
 	/* 3096 + 2808 in chunks 0 and 2, 4096 in chunk 1 */
 	KUNIT_EXPECT_EQ(test, ec_shard_bytes(1000, 10000, 4096, 2, 0), 5904);
 	KUNIT_EXPECT_EQ(test, ec_shard_bytes(1000, 10000, 4096, 2, 1), 4096);
 	KUNIT_EXPECT_EQ(test, ec_shard_bytes(4096, 4096, 4096, 4, 3), 0);
+
+	for (k = 1; k <= 4; k++) {
+		for (chunk = 1; chunk <= 5; chunk += 2) {
+			for (raw = 0; raw < k; raw++)
+				test_shard_bytes_layout(test, chunk, k, raw);
+		}
+	}
+
+	/* a stripe_width near U32_MAX: 5 bytes into shard 1 of stripe 3 */
+	chunk = 0x7ffff800;
+	off = 3ULL * 2 * chunk + chunk + 5;
+	KUNIT_EXPECT_EQ(test, ec_shard_bytes(off, chunk, chunk, 2, 1),
+			chunk - 5);
+	KUNIT_EXPECT_EQ(test, ec_shard_bytes(off, chunk, chunk, 2, 0), 5);
+	/* a stripe far into a large object */
+	KUNIT_EXPECT_EQ(test, ec_shard_bytes(1ULL << 40, 8 << 20, 1 << 20, 8, 7),
+			1 << 20);
 }
 
 /* 2+1 over two zones */
