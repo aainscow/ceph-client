@@ -419,7 +419,7 @@ enum {
 	CEPH_OSD_FLAG_KNOWN_REDIR = 0x400000,  /* redirect bit is authoritative */
 	CEPH_OSD_FLAG_FULL_TRY =    0x800000,  /* try op despite full flag */
 	CEPH_OSD_FLAG_FULL_FORCE = 0x1000000,  /* force op despite full flag */
-	CEPH_OSD_FLAG_EC_DIRECT_READ = 0x10000000, /* EC read direct to a shard */
+	CEPH_OSD_FLAG_EC_DIRECT_READ = 0x10000000, /* EC read of one shard */
 	CEPH_OSD_FLAG_FAIL_ON_EAGAIN = 0x20000000, /* fail op on -EAGAIN */
 	CEPH_OSD_FLAG_FORCE_OSD = 0x40000000,  /* target OSD is forced */
 };
