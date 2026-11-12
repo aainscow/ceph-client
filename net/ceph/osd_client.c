@@ -4817,12 +4817,16 @@ recalc_linger_target(struct ceph_osd_linger_request *lreq);
  * order, the requests on @osd for objects between the old watermark and
  * @wm, @tid among them, so that they reach the target in the order they
  * were sent.  Replies to the old tids are ignored.  Then move the linger
- * requests on @osd whose objects have migrated.  Takes ownership of @wm.
+ * requests on @osd whose objects have migrated.  @new_mw keeps the
+ * watermark of a PG that has none yet: without it, request @tid fails with
+ * -ENOMEM rather than going back to the source.  Takes ownership of @wm
+ * and @new_mw.
  */
 static void handle_migration_redirect(struct ceph_osd_client *osdc,
 				      struct ceph_osd *osd,
 				      const struct ceph_pg *pgid,
-				      struct ceph_hobject_id *wm, u64 tid)
+				      struct ceph_hobject_id *wm,
+				      struct migration_wm *new_mw, u64 tid)
 {
 	struct migration_wm *mw;
 	struct rb_root resend = RB_ROOT;
@@ -4831,6 +4835,17 @@ static void handle_migration_redirect(struct ceph_osd_client *osdc,
 	verify_osdc_wrlocked(osdc);
 
 	mw = lookup_migration_wm(&osdc->migration_wms, pgid);
+	if (!mw && !new_mw) {
+		struct ceph_osd_request *req;
+
+		mutex_lock(&osd->lock);
+		req = lookup_request(&osd->o_requests, tid);
+		if (req)
+			complete_request(req, -ENOMEM);
+		mutex_unlock(&osd->lock);
+		free_hoid(wm);
+		return;
+	}
 
 	mutex_lock(&osd->lock);
 	for (n = rb_first(&osd->o_requests); n; ) {
@@ -4857,18 +4872,17 @@ static void handle_migration_redirect(struct ceph_osd_client *osdc,
 	mutex_unlock(&osd->lock);
 
 	if (!mw) {
-		mw = alloc_migration_wm();
-		if (mw) {
-			mw->pgid = *pgid;
-			swap(mw->wm, wm);
-			insert_migration_wm(&osdc->migration_wms, mw);
-		} else {
-			pr_err("%s failed to allocate watermark\n", __func__);
-		}
+		mw = new_mw;
+		new_mw = NULL;
+		mw->pgid = *pgid;
+		swap(mw->wm, wm);
+		insert_migration_wm(&osdc->migration_wms, mw);
 	} else if (hoid_compare(wm, mw->wm) > 0) {
 		swap(mw->wm, wm);
 	}
 	free_hoid(wm);
+	if (new_mw)
+		free_migration_wm(new_mw);
 
 	for (n = rb_first(&resend); n; ) {
 		struct ceph_osd_request *req =
@@ -4972,18 +4986,24 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
 
 	if (m.redirect.migration_wm) {
 		struct ceph_pg pgid = m.pgid; /* struct */
+		struct migration_wm *mw;
 
 		dout("req %p tid %llu migration redirect pool %lld\n", req,
 		     req->r_tid, m.redirect.oloc.pool);
 		mutex_unlock(&osd->lock);
 		up_read(&osdc->lock);
 
+		mw = alloc_migration_wm();
 		down_write(&osdc->lock);
-		if (osd_registered(osd))
+		if (osd_registered(osd)) {
 			handle_migration_redirect(osdc, osd, &pgid,
-						  m.redirect.migration_wm, tid);
-		else
+						  m.redirect.migration_wm, mw,
+						  tid);
+		} else {
 			free_hoid(m.redirect.migration_wm);
+			if (mw)
+				free_migration_wm(mw);
+		}
 		up_write(&osdc->lock);
 		return;
 	}
