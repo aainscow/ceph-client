@@ -3,12 +3,14 @@
 #include <linux/ceph/ceph_debug.h>
 
 #include <linux/module.h>
+#include <linux/bsearch.h>
 #include <linux/err.h>
 #include <linux/highmem.h>
 #include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/uaccess.h>
 #ifdef CONFIG_BLOCK
 #include <linux/bio.h>
@@ -453,6 +455,8 @@ static void target_copy(struct ceph_osd_request_target *dest,
 	dest->sort_bitwise = src->sort_bitwise;
 	dest->recovery_deletes = src->recovery_deletes;
 	dest->ec_optimizations = src->ec_optimizations;
+	dest->pg_migrating = src->pg_migrating;
+	dest->pool_pgs_migrating = src->pool_pgs_migrating;
 
 	dest->flags = src->flags;
 	dest->used_replica = src->used_replica;
@@ -1583,6 +1587,83 @@ enum calc_target_result {
 	CALC_TARGET_POOL_DNE,
 };
 
+static int cmp_u32(const void *a, const void *b)
+{
+	return cmp_int(*(const u32 *)a, *(const u32 *)b);
+}
+
+static bool is_pg_migrating(const struct ceph_pg_pool_info *pi, u32 seed)
+{
+	return bsearch(&seed, pi->migrating_pgs, pi->num_migrating_pgs,
+		       sizeof(seed), cmp_u32);
+}
+
+/* a PG of a migration source that has finished migrating */
+static bool has_pg_migrated(const struct ceph_pg_pool_info *pi, u32 seed)
+{
+	return pi->migration_target >= 0 && seed >= pi->lowest_migrated_pg &&
+	       !is_pg_migrating(pi, seed);
+}
+
+/*
+ * While its pool takes part in a pool migration, send @t to the pool
+ * that holds the object, as Objecter does.  The tip of a migration chain
+ * carries the pool's name, so go back to the chain's root first, then to
+ * the latest source, and on to the target once the object's PG has
+ * migrated.  Ops for a pool flagged EIO on the way are sent to it, for its
+ * OSDs to fail them.
+ */
+static int calc_migration_target(struct ceph_osd_client *osdc,
+				 struct ceph_osd_request_target *t,
+				 struct ceph_pg_pool_info **ppi)
+{
+	struct ceph_osdmap *map = osdc->osdmap;
+	struct ceph_pg_pool_info *pi = *ppi;
+	struct ceph_pg_pool_info *tpi;
+	struct ceph_pg raw_pgid, pgid;
+	bool migrated;
+
+	if (pi->migration_root >= 0) {
+		pi = ceph_pg_pool_by_id(map, pi->migration_root);
+		if (!pi)
+			return -ENOENT;
+	}
+	if (pi->migration_target < 0)
+		goto out;
+
+	tpi = ceph_pg_pool_by_id(map, pi->migration_target);
+	if (!tpi)
+		return -ENOENT;
+
+	if (tpi->migration_src < 0 || (tpi->flags & CEPH_POOL_FLAG_EIO)) {
+		migrated = true;	/* finished, or failing all ops */
+	} else {
+		if (tpi->migration_src != pi->id) {
+			/* cascaded migration: start from the latest source */
+			pi = ceph_pg_pool_by_id(map, tpi->migration_src);
+			if (!pi)
+				return -ENOENT;
+			if (pi->flags & CEPH_POOL_FLAG_EIO)
+				goto out;
+		}
+
+		t->target_oloc.pool = pi->id;
+		__ceph_object_locator_to_pg(pi, &t->target_oid,
+					    &t->target_oloc, &raw_pgid);
+		pgid.pool = raw_pgid.pool;
+		pgid.seed = ceph_stable_mod(raw_pgid.seed, pi->pg_num,
+					    pi->pg_num_mask);
+		migrated = has_pg_migrated(pi, pgid.seed);
+	}
+	if (migrated)
+		pi = tpi;
+
+out:
+	t->target_oloc.pool = pi->id;
+	*ppi = pi;
+	return 0;
+}
+
 static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 					   struct ceph_osd_request_target *t,
 					   bool any_change)
@@ -1600,7 +1681,7 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 	bool sort_bitwise = ceph_osdmap_flag(osdc, CEPH_OSDMAP_SORTBITWISE);
 	bool recovery_deletes = ceph_osdmap_flag(osdc,
 						 CEPH_OSDMAP_RECOVERY_DELETES);
-	bool ec_optimizations;
+	bool ec_optimizations, pg_migrating, pool_pgs_migrating;
 	enum calc_target_result ct_res;
 
 	t->epoch = osdc->osdmap->epoch;
@@ -1637,10 +1718,21 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		}
 	}
 
+	if (calc_migration_target(osdc, t, &pi)) {
+		t->osd = CEPH_HOMELESS_OSD;
+		ct_res = CALC_TARGET_POOL_DNE;
+		goto out;
+	}
+
 	__ceph_object_locator_to_pg(pi, &t->target_oid, &t->target_oloc, &pgid);
 	last_pgid.pool = pgid.pool;
 	last_pgid.seed = ceph_stable_mod(pgid.seed, t->pg_num, t->pg_num_mask);
 	ec_optimizations = pi->flags & CEPH_POOL_FLAG_EC_OPTIMIZATIONS;
+	/* the object's PG in this map: last_pgid is PG 0 at first */
+	pg_migrating = is_pg_migrating(pi, ceph_stable_mod(pgid.seed,
+							   pi->pg_num,
+							   pi->pg_num_mask));
+	pool_pgs_migrating = pi->num_migrating_pgs;
 
 	ceph_pg_to_up_acting_osds(osdc->osdmap, pi, &pgid, &up, &acting);
 	if (any_change &&
@@ -1660,6 +1752,10 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 				 recovery_deletes,
 				 t->ec_optimizations,
 				 ec_optimizations,
+				 t->pg_migrating,
+				 pg_migrating,
+				 t->pool_pgs_migrating,
+				 pool_pgs_migrating,
 				 &last_pgid))
 		force_resend = true;
 
@@ -1691,6 +1787,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		t->sort_bitwise = sort_bitwise;
 		t->recovery_deletes = recovery_deletes;
 		t->ec_optimizations = ec_optimizations;
+		t->pg_migrating = pg_migrating;
+		t->pool_pgs_migrating = pool_pgs_migrating;
 
 		if ((t->flags & (CEPH_OSD_FLAG_BALANCE_READS |
 				 CEPH_OSD_FLAG_LOCALIZE_READS)) &&
