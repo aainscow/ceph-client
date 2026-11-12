@@ -1188,11 +1188,12 @@ static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
 		ceph_decode_skip_8(p, end, bad);
 
 		ceph_decode_8_safe(p, end, pi->num_zones, bad);
-		if (!pi->num_zones || pi->size % pi->num_zones)
-			goto bad;
 	} else {
 		pi->num_zones = 1;
 	}
+	/* ceph_pool_zone_size() divides by the zone size */
+	if (!pi->size || !pi->num_zones || pi->size % pi->num_zones)
+		goto bad;
 
 	/* ignore the rest */
 
