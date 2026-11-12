@@ -2239,6 +2239,97 @@ static void migration_linger_test(struct kunit *test)
 	test_unwatch(lreq);
 }
 
+/*
+ * Not fixed yet: a split read cancelled and released by its owner while
+ * its sub-reads are out, as ceph_osdc_wait_request() leaves one when
+ * interrupted.  ec_split_finish() reads the parent's r_osdc before it
+ * checks for the cancellation, after the parent is gone (KASAN:
+ * slab-use-after-free in ec_split_sub_cb()).
+ */
+static void split_read_cancel_release_test(struct kunit *test)
+{
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_request *req;
+	struct ceph_ec_split *sp;
+
+	req = test_split_read(test, osdc, CEPH_OSD_OP_READ);
+	sp = req->r_ec_split;
+	KUNIT_ASSERT_NOT_NULL(test, sp);
+	ceph_osdc_cancel_request(req);
+	ceph_osdc_put_request(req);
+
+	test_sub_error(test, sp, 0, -EIO);
+	test_sub_error(test, sp, 1, -EIO);	/* the last finishes it */
+	KUNIT_EXPECT_EQ(test, atomic_read(&osdc->num_requests), 0);
+}
+
+/* An object of @pool in a PG other than 0, and its PG */
+static void test_pg_not_0(struct ceph_osd_client *osdc, s64 pool, char *name,
+			  struct ceph_pg *pgid)
+{
+	struct ceph_osds acting;
+	int i;
+
+	for (i = 0; i < 64; i++) {
+		snprintf(name, 16, "o%d", i);
+		test_acting(osdc, pool, name, pgid, &acting);
+		if (pgid->seed)
+			return;
+	}
+}
+
+/*
+ * Not fixed yet: calc_target() keeps whether the object's PG is migrating
+ * as found for last_pgid, which is PG 0 on a target's first calculation,
+ * since t->pg_num is 0 then.  Objecter keeps the migrating PGs and asks the
+ * old and the new set about the same PG (PastIntervals::is_new_interval()).
+ * So with PG 0 not migrating and the object's PG migrating, the next
+ * calculation that checks for a new interval finds one: a single-chunk
+ * direct read goes to the primary as it is submitted (calc_target() runs
+ * twice then), and a watch is resent on an unrelated map change.
+ */
+static void pg_migrating_first_calc_test(struct kunit *test)
+{
+	struct test_osdmap *tm = ceph_kunit_osdmap_dup(test, &client_map);
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_linger_request *lreq;
+	struct ceph_osd_request *req;
+	struct ceph_osds acting;
+	struct ceph_pg pgid;
+	char rep[16], ec[16];
+	u64 tid;
+
+	test_pg_not_0(osdc, TEST_POOL_REP, rep, &pgid);
+	KUNIT_ASSERT_NE(test, pgid.seed, 0);
+	tm->pools[0].migration_target = TEST_POOL_DST;
+	tm->pools[0].num_migrating_pgs = 1;
+	tm->pools[0].migrating_pgs[0] = pgid.seed;
+	tm->pools[3].migration_src = TEST_POOL_REP;
+	tm->pools[3].migration_root = TEST_POOL_REP;
+	test_pg_not_0(osdc, TEST_POOL_EC, ec, &pgid);
+	KUNIT_ASSERT_NE(test, pgid.seed, 0);
+	tm->pools[1].migration_target = TEST_POOL_EC_ZONES;
+	tm->pools[1].num_migrating_pgs = 1;
+	tm->pools[1].migrating_pgs[0] = pgid.seed;
+	tm->pools[2].migration_src = TEST_POOL_EC;
+	tm->pools[2].migration_root = TEST_POOL_EC;
+	test_apply_map(test, osdc, tm);
+
+	test_acting(osdc, TEST_POOL_EC, ec, &pgid, &acting);
+	req = test_read(test, osdc, TEST_POOL_EC, ec, CEPH_OSD_OP_READ,
+			TEST_CHUNK, 1000, CEPH_OSD_FLAG_BALANCE_READS);
+	ceph_osdc_start_request(osdc, req);
+	KUNIT_EXPECT_EQ(test, test_osd(req), acting.osds[1]);
+	test_put(test, req);
+
+	lreq = test_watch(test, osdc, TEST_POOL_REP, rep);
+	tid = test_linger_tid(lreq);
+	tm->pools[3].min_size = 1;		/* an unrelated change */
+	test_apply_map(test, osdc, tm);
+	KUNIT_EXPECT_EQ(test, test_linger_tid(lreq), tid);
+	test_unwatch(lreq);
+}
+
 static struct kunit_case ceph_osd_client_test_cases[] = {
 	KUNIT_CASE(ec_direct_read_pool_test),
 	KUNIT_CASE(ec_direct_read_shard_test),
@@ -2283,6 +2374,7 @@ static struct kunit_case ceph_osd_client_split_test_cases[] = {
 	KUNIT_CASE(split_read_sparse_test),
 	KUNIT_CASE(split_read_migration_test),
 	KUNIT_CASE(version_read_test),
+	KUNIT_CASE(split_read_cancel_release_test),
 	{}
 };
 
@@ -2306,6 +2398,7 @@ static struct kunit_suite ceph_osd_client_reply_test_suite = {
 static struct kunit_case ceph_osd_client_migration_test_cases[] = {
 	KUNIT_CASE(migration_redirect_test),
 	KUNIT_CASE(migration_linger_test),
+	KUNIT_CASE(pg_migrating_first_calc_test),
 	{}
 };
 
