@@ -224,6 +224,8 @@ struct ceph_osd_request_target {
 	bool sort_bitwise;
 	bool recovery_deletes;
 	bool ec_optimizations;
+	bool pg_migrating;
+	bool pool_pgs_migrating;
 
 	unsigned int flags;                /* CEPH_OSD_FLAG_* */
 	bool used_replica;
@@ -420,6 +422,7 @@ struct ceph_osd_client {
 	struct rb_root         linger_requests; /* lingering requests */
 	struct rb_root         map_checks;
 	struct rb_root         linger_map_checks;
+	struct rb_root         migration_wms; /* PG -> migration watermark */
 	atomic_t               num_requests;
 	atomic_t               num_homeless;
 	int                    abort_err;
