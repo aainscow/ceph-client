@@ -3362,7 +3362,7 @@ static void ec_split_finish(struct ceph_ec_split *sp)
 			ok++;
 		else if (sreq->r_result == -ENOENT)
 			enoent++;
-		else if (sreq->r_result == -EOPNOTSUPP || rval == -EOPNOTSUPP)
+		else if (rval == -EOPNOTSUPP)
 			opnotsupp = true;
 	}
 
