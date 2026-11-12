@@ -466,6 +466,7 @@ static void target_copy(struct ceph_osd_request_target *dest,
 	dest->used_replica = src->used_replica;
 	dest->ec_read_off = src->ec_read_off;
 	dest->ec_read_len = src->ec_read_len;
+	dest->ec_forced_shard = src->ec_forced_shard;
 	dest->paused = src->paused;
 
 	dest->epoch = src->epoch;
@@ -1816,7 +1817,9 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 
 	ceph_pg_to_up_acting_osds(osdc->osdmap, pi, &pgid, &up, &acting);
 	/* OSDs drop direct reads sent in an earlier interval */
-	if ((any_change || (t->flags & CEPH_OSD_FLAG_EC_DIRECT_READ)) &&
+	if ((any_change ||
+	     (t->flags & (CEPH_OSD_FLAG_EC_DIRECT_READ |
+			  CEPH_OSD_FLAG_FORCE_OSD))) &&
 	    ceph_is_new_interval(&t->acting,
 				 &acting,
 				 &t->up,
@@ -1885,6 +1888,17 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 			}
 			t->osd = acting.osds[pos];
 			t->used_replica = pos > 0;
+		} else if (t->flags & CEPH_OSD_FLAG_FORCE_OSD) {
+			int shard = t->ec_forced_shard;
+
+			/* that shard only, homeless if it has no OSD */
+			if (shard < acting.size &&
+			    acting.osds[shard] != CRUSH_ITEM_NONE)
+				t->osd = acting.osds[shard];
+			else
+				t->osd = CEPH_HOMELESS_OSD;
+			t->spgid.shard = shard;
+			t->used_replica = true;
 		} else {
 			int shard;
 
@@ -2696,6 +2710,9 @@ again:
 		}
 	} else if (!osd_homeless(osd)) {
 		need_send = true;
+	} else if (req->r_flags & CEPH_OSD_FLAG_FAIL_ON_EAGAIN) {
+		dout("req %p fail_on_eagain homeless\n", req);
+		err = -EAGAIN;
 	} else {
 		maybe_request_map(osdc);
 	}
@@ -4285,7 +4302,8 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
 		goto out_unlock_osdc;
 	}
 
-	if (m.result == -EAGAIN) {
+	if (m.result == -EAGAIN &&
+	    !(req->r_flags & CEPH_OSD_FLAG_FAIL_ON_EAGAIN)) {
 		dout("req %p tid %llu EAGAIN\n", req, req->r_tid);
 		unlink_request(osd, req);
 		mutex_unlock(&osd->lock);
@@ -4465,10 +4483,19 @@ static void scan_requests(struct ceph_osd *osd,
 			fallthrough;
 		case CALC_TARGET_NEED_RESEND:
 			cancel_map_check(req);
+			if (req->r_flags & CEPH_OSD_FLAG_FAIL_ON_EAGAIN) {
+				complete_request(req, -EAGAIN);
+				break;
+			}
 			unlink_request(osd, req);
 			insert_request(need_resend, req);
 			break;
 		case CALC_TARGET_POOL_DNE:
+			if (req->r_flags & CEPH_OSD_FLAG_FAIL_ON_EAGAIN) {
+				cancel_map_check(req);
+				complete_request(req, -EAGAIN);
+				break;
+			}
 			check_pool_dne(req);
 			break;
 		}
