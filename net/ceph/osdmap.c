@@ -1080,7 +1080,8 @@ static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
 
 		ceph_decode_8_safe(p, end, present, bad);
 		if (present)
-			ceph_decode_8_safe(p, end, pi->ec_data_shard_count, bad);
+			ceph_decode_8_safe(p, end, pi->ec_data_shard_count,
+					   bad);
 		else
 			pi->ec_data_shard_count = 0;
 
