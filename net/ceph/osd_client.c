@@ -3008,18 +3008,25 @@ struct ceph_ec_split {
 	struct ec_split_sub subs[] __counted_by(num_subs);
 };
 
+/*
+ * The bytes of [0, @end) in the chunks of data shard @raw.  @chunk * @k is
+ * the pool's stripe_width, so it and the offsets within a stripe fit in 32
+ * bits.
+ */
+static u64 ec_bytes_up_to(u64 end, u32 chunk, u32 k, u32 raw)
+{
+	u32 start = raw * chunk;
+	u32 rem;
+	u64 stripes = div_u64_rem(end, chunk * k, &rem);
+
+	return stripes * chunk + clamp(rem, start, start + chunk) - start;
+}
+
 /* The bytes of [@off, @off + @len) in the chunks of data shard @raw. */
 static u64 ec_shard_bytes(u64 off, u64 len, u32 chunk, u32 k, u32 raw)
 {
-	u64 end = off + len, c, n = 0;
-
-	for (c = div_u64(off, chunk); c * chunk < end; c++) {
-		u64 r = c;
-
-		if (do_div(r, k) == raw)
-			n += min(end, (c + 1) * chunk) - max(off, c * chunk);
-	}
-	return n;
+	return ec_bytes_up_to(off + len, chunk, k, raw) -
+	       ec_bytes_up_to(off, chunk, k, raw);
 }
 
 static bool ec_split_data_ok(struct ceph_osd_data *osd_data)
