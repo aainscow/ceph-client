@@ -148,6 +148,33 @@ regressions (9) and mixed releases.
    freed by its owner while its sub-reads are out (an interrupted
    ceph_osdc_wait_request()) must not be touched when they complete:
    split_read_cancel_release_test under KASAN.
+11. **Chaos with kernel clients (added 2026-11-12, owner: "I want to see
+   pool migration in the mix of vstart_chaos").**  vstart_chaos (ceph PR
+   72412) drives a second cluster on the machine (harness/chaos/: BlueStore
+   on files, 12 OSDs in dc1/dc2, tiebreaker mon in dc3) while its workloads
+   are kernel clients in KVM guests: the krbd verify loop on images with
+   read_from_replica=balance, localize (crush_location in each zone) and
+   none, ms_mode legacy/crc/secure, and a CephFS loop (write, cold read
+   whole/ranges/O_DIRECT, overwrite, truncate, extend) on an EC data pool.
+   Guests restart when they finish, so clients also map and mount mid-chaos;
+   each fails on bad data, any kernel WARN/BUG/KASAN/lockdep/hung-task report
+   or kmemleak leak, and the run stops if a guest makes no progress for 15
+   minutes.  Chaos actions: OSD down/kill/out/reweight/primary-affinity,
+   upmaps, pg_num splits and merges, repeer, deep scrub, and on the two-zone
+   pools zone_partial and zone failovers (pool stretch mode); quiesce with
+   deep scrub every 30 cycles.  Pool migration runs as a workload
+   (pool_migrator.py) on the pools the kernel uses: replicated -> EC, EC ->
+   EC with another k (and another zone layout), EC -> replicated, plus
+   refused cascades.  Not tested before: chaos ran with a migrate workload
+   on 2026-10-27, librados clients only.  Runs:
+   - Z: every pool over two zones (EC 4+2 per zone, replicated 3 per zone),
+     zone faults, migrations between the two-zone layouts.
+   - U: upgrade: the cluster starts on Umbrella (v21.2.0) with kernel
+     clients running (split reads switch to GET_INTERNAL_VERSIONS once per
+     client), is upgraded under load onto the series' Ceph build (rolling
+     mon and OSD restarts, upgrade_cluster.sh), then runs chaos with
+     migrations on single-zone pools (replicated, EC 4+2, EC 8+3, CephFS on
+     EC 4+2).
 
 ## 4a. Design decisions and the tests that cover them
 
@@ -157,7 +184,7 @@ regressions (9) and mixed releases.
 | Split reads are not used while the pool takes part in a migration; single-chunk direct reads are | Sub-reads pick shards once; a watermark move can send a sub-read to a pool with another EC layout | KUnit: split_read_migration_test; VM: EC->EC migration with a different k under read_from_replica=balance, data verified; counters show no splits during the migration and splits after |
 | Reads whose reply version is used (CephFS fscrypt RMW and truncate) go to the primary | Non-primary shards of optimized EC pools can lag, split reads carry no version (F1) | KUnit (libceph side only; fs/ceph has no KUnit): version_read_test; VM: fscrypt directory on the EC data pool with balance, unaligned writes and truncates, data verified |
 | Localized reads use one local zone per read (first OSD of each zone) and fall back to the primary if a shard is missing there; balanced reads pick a random readable zone per shard | Mirrors SplitOp (F2) | KUnit: ec_choose_read_shard_test, localize_zone_test, balance_zones_test; VM: zone tests (localize stays in zone; remote zone down; local shard down -> primary) |
-| A direct read whose PG changes, or that sees any new interval (e.g. min_size), goes to the primary | Mirrors Objecter FORCE_OSD handling; OSDs drop direct reads of an earlier interval (F3) | KUnit: direct_read_pg_change_test, direct_read_interval_test, direct_read_migrating_test, split_read_interval_test; VM: direct reads under min_size changes, primary_temp moves and OSD down/up |
+| A direct read whose PG changes, or that sees any new interval (e.g. min_size), goes to the primary, also when a pool migration moves it to a replicated pool (2026-11-12, N3) | Mirrors Objecter FORCE_OSD handling; OSDs drop direct reads of an earlier interval (F3); OSDs refuse EC direct reads on pools without EC optimizations with -EOPNOTSUPP (since ceph PR 72651) | KUnit: direct_read_pg_change_test, direct_read_interval_test, direct_read_migrating_test, split_read_interval_test, direct_read_migration_redirect_test; VM: direct reads under min_size changes, primary_temp moves and OSD down/up; M04 (EC 4+2 -> replicated under balance reads) |
 | EC optimizations being enabled on a pool is a new interval | OSDs start a new interval then; no forced resend from the mons | KUnit: ec_optimizations_interval_test, new_interval_test; VM: enable allow_ec_optimizations on a pool under krbd I/O, no hung requests |
 | Ops for a migration target or latest source flagged EIO are sent there, for its OSDs to fail them | The kernel doesn't set SUPPORTSPOOLEIO, so OSDs reply -EIO | KUnit: calc_migration_target_test; VM: set eio on the target during a migration |
 | Linger requests move on a migration redirect | Mirrors Objecter (review: Bill Scales asked for watch/notify/ack tests) | KUnit: migration_linger_test, migration_redirect_test (resend order, forward-only watermark); VM: watch, notify to and from the kernel, and notify acks during and after migrations (section 4.5) |
