@@ -3005,6 +3005,7 @@ struct ec_split_sub {
 };
 
 struct ceph_ec_split {
+	struct ceph_osd_client *osdc;
 	struct ceph_osd_request *req;
 	atomic_t pending;
 	atomic_t state;
@@ -3274,6 +3275,7 @@ static struct ceph_ec_split *alloc_ec_split(struct ceph_osd_request *req,
 		return NULL;
 
 	sp->num_subs = num_subs;
+	sp->osdc = req->r_osdc;
 	sp->req = req;
 	sp->chunk = chunk;
 	sp->k = k;
@@ -3321,7 +3323,6 @@ static void ec_split_complete(struct ceph_osd_request *req, int result)
 	req->r_result = result;
 	req->r_ec_split = NULL;
 	finish_request(req);
-	__complete_request(req);
 }
 
 static bool ec_split_sub_ok(struct ceph_osd_request *sreq)
@@ -3340,17 +3341,11 @@ static bool ec_split_sub_ok(struct ceph_osd_request *sreq)
 
 static void ec_split_finish(struct ceph_ec_split *sp)
 {
+	struct ceph_osd_client *osdc = sp->osdc;
 	struct ceph_osd_request *req = sp->req;
-	struct ceph_osd_client *osdc;
 	int i, ok = 0, enoent = 0;
 	bool opnotsupp = false;
-
-	/* a cancelled read may have been freed already */
-	if (atomic_cmpxchg(&sp->state, EC_SPLIT_RUNNING,
-			   EC_SPLIT_FINISHING) != EC_SPLIT_RUNNING)
-		goto out;
-
-	osdc = req->r_osdc;
+	bool done, absent;
 
 	for (i = 0; i < sp->num_subs; i++) {
 		struct ceph_osd_request *sreq = sp->subs[i].req;
@@ -3372,23 +3367,45 @@ static void ec_split_finish(struct ceph_ec_split *sp)
 		pr_notice("OSDs don't support get-internal-versions-v2; split reads will use get-internal-versions\n");
 	}
 
-	if (ok == sp->num_subs && ec_split_versions_match(sp)) {
+	done = ok == sp->num_subs && ec_split_versions_match(sp);
+	absent = enoent == sp->num_subs;
+
+	/*
+	 * ceph_osdc_cancel_request() cancels the read either before this or
+	 * after it has been completed or resent to the primary.  Resending
+	 * takes osdc->lock for write, so that it can't be promoted to it.
+	 */
+	if (done || absent)
+		down_read(&osdc->lock);
+	else
+		down_write(&osdc->lock);
+
+	/* a cancelled read may have been freed already */
+	if (atomic_cmpxchg(&sp->state, EC_SPLIT_RUNNING,
+			   EC_SPLIT_FINISHING) != EC_SPLIT_RUNNING) {
+		req = NULL;
+	} else if (done) {
 		ec_split_complete(req, ec_split_assemble(sp));
-	} else if (enoent == sp->num_subs) {
+	} else if (absent) {
 		ec_split_complete(req, -ENOENT);
 	} else {
 		dout("%s req %p to the primary\n", __func__, req);
 		atomic64_inc(&osdc->ec_split_fallbacks);
-		down_read(&osdc->lock);
 		req->r_ec_split = NULL;
 		req->r_flags &= ~(CEPH_OSD_FLAG_BALANCE_READS |
 				  CEPH_OSD_FLAG_LOCALIZE_READS);
 		req->r_t.pgid.pool = 0;
 		req->r_t.pgid.seed = 0;
-		__submit_request(req, false);
-		up_read(&osdc->lock);
+		__submit_request(req, true);
+		req = NULL;
 	}
-out:
+
+	if (done || absent)
+		up_read(&osdc->lock);
+	else
+		up_write(&osdc->lock);
+	if (req)
+		__complete_request(req);
 	ec_split_release(sp);
 }
 
