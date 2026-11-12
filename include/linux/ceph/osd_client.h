@@ -72,8 +72,8 @@ struct ceph_sparse_read {
 	u32				sr_count;    /* extent count in reply */
 	int				sr_ext_len;  /* length of extent array */
 	struct ceph_sparse_extent	*sr_extent;  /* extent array */
-	u64				sr_plain_cap; /* plain op: buffer length */
-	u32				sr_plain_len; /* plain op: data length */
+	u64				sr_plain_cap; /* plain op buffer size */
+	u32				sr_plain_len; /* plain op data size */
 	bool				sr_plain;     /* current op is plain */
 };
 
