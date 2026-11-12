@@ -842,7 +842,6 @@ e_inval:
 	return -EINVAL;
 }
 
-/* set<pg_t> of the pool's own PGs, so the seeds are ascending */
 static int decode_migrating_pgs(void **p, void *end,
 				struct ceph_pg_pool_info *pi)
 {
