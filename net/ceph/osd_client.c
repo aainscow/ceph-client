@@ -1965,6 +1965,13 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		t->pg_migrating = pg_migrating;
 		t->pool_pgs_migrating = pool_pgs_migrating;
 
+		/* a direct read whose PG changed goes to the primary */
+		if ((t->flags & CEPH_OSD_FLAG_EC_DIRECT_READ) &&
+		    !(t->flags & CEPH_OSD_FLAG_FORCE_OSD))
+			t->flags &= ~(CEPH_OSD_FLAG_BALANCE_READS |
+				      CEPH_OSD_FLAG_LOCALIZE_READS |
+				      CEPH_OSD_FLAG_EC_DIRECT_READ);
+
 		if ((t->flags & (CEPH_OSD_FLAG_BALANCE_READS |
 				 CEPH_OSD_FLAG_LOCALIZE_READS)) &&
 		    !is_write && pi->type == CEPH_POOL_TYPE_REP &&
@@ -1991,15 +1998,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 			t->spgid.shard = shard;
 			t->used_replica = true;
 		} else {
-			int shard;
+			int shard = ec_direct_read_shard(osdc, t, pi, &acting);
 
-			/* a direct read whose PG changed goes to the primary */
-			if (t->flags & CEPH_OSD_FLAG_EC_DIRECT_READ)
-				t->flags &= ~(CEPH_OSD_FLAG_BALANCE_READS |
-					      CEPH_OSD_FLAG_LOCALIZE_READS |
-					      CEPH_OSD_FLAG_EC_DIRECT_READ);
-
-			shard = ec_direct_read_shard(osdc, t, pi, &acting);
 			if (shard >= 0) {
 				t->osd = acting.osds[shard];
 				t->spgid.shard = shard;
