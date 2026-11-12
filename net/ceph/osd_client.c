@@ -1594,6 +1594,12 @@ static int pick_closest_replica(struct ceph_osd_client *osdc,
 	return best_i;
 }
 
+/* pg_pool_t::allows_nonprimary_reads() */
+static bool allows_nonprimary_reads(const struct ceph_pg_pool_info *pi)
+{
+	return pi->tier_of < 0 && !pi->has_tiers && pi->dedup_tier <= 0;
+}
+
 /*
  * EC direct reads: a client that reads from replicas can read from the
  * shards of an optimized EC pool that allows it, rather than from the
@@ -1614,7 +1620,7 @@ static bool ec_direct_read_pool(const struct ceph_osd_request_target *t,
 	return pi->type == CEPH_POOL_TYPE_EC &&
 	       (pi->flags & CEPH_POOL_FLAG_CLIENT_SPLIT_READS) &&
 	       !(pi->flags & (CEPH_POOL_FLAG_CRIMSON | CEPH_POOL_FLAG_EIO)) &&
-	       pi->read_tier < 0 && pi->write_tier < 0;
+	       allows_nonprimary_reads(pi);
 }
 
 static u32 ec_data_shards(const struct ceph_pg_pool_info *pi)
