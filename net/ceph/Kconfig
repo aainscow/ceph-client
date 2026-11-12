@@ -51,7 +51,10 @@ config CEPH_LIB_KUNIT_TEST
 	depends on CEPH_LIB && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
-	  Build KUnit tests for the decoding of OSD maps and the targeting
-	  of OSD requests in libceph.  They run when libceph is loaded.
+	  Build KUnit tests for libceph: the decoding of OSD maps and pools,
+	  the placement of PGs, and the targeting, redirecting, splitting and
+	  completion of OSD requests.  The tests use maps encoded as the
+	  monitors encode them and play OSD replies through the client, whose
+	  sessions never connect.  They run when libceph is loaded.
 
 	  If unsure, say N.

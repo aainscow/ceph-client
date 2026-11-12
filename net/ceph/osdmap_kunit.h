@@ -38,6 +38,9 @@ struct test_pool {
 	u32 migrating_pgs[4];
 	u32 lowest_migrated_pg;
 	u8 num_zones;
+	s64 tier_of;			/* none if 0 */
+	s64 tier;			/* the one entry of tiers if not 0 */
+	s64 dedup_tier;			/* in opts if not 0 */
 };
 
 /* pg_temp, or primary_temp and pg_upmap_primaries in osds[0] */
@@ -61,6 +64,7 @@ struct test_osdmap {
 	struct test_pg_mapping primary_temp[4];
 	int num_upmap_primaries;
 	struct test_pg_mapping upmap_primaries[4];
+	u8 rule_max_size;		/* of every rule, 100 if 0 */
 };
 
 size_t ceph_kunit_encode_osdmap(void *buf, const struct test_osdmap *tm);

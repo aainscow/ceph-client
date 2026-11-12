@@ -128,8 +128,13 @@ static size_t encode_pool(void *buf, const struct test_pool *tp)
 	ceph_encode_8(&p, tp->min_size ?: tp->size - 1);
 	ceph_encode_64(&p, 0);			/* quota_max_bytes */
 	ceph_encode_64(&p, 0);			/* quota_max_objects */
-	ceph_encode_32(&p, 0);			/* tiers */
-	ceph_encode_64(&p, -1);			/* tier_of */
+	if (tp->tier) {
+		ceph_encode_32(&p, 1);		/* tiers */
+		ceph_encode_64(&p, tp->tier);
+	} else {
+		ceph_encode_32(&p, 0);
+	}
+	ceph_encode_64(&p, tp->tier_of ?: -1);
 	ceph_encode_8(&p, 0);			/* cache_mode */
 	ceph_encode_64(&p, -1);			/* read_tier */
 	ceph_encode_64(&p, -1);			/* write_tier */
@@ -151,8 +156,16 @@ static size_t encode_pool(void *buf, const struct test_pool *tp)
 	ceph_encode_8(&p, 0);			/* v21 */
 	ceph_encode_8(&p, 0);			/* v22 */
 	ceph_encode_64(&p, 0);			/* v23 */
-	ceph_start_encoding(&p, 2, 1, 4);	/* v24 opts */
-	ceph_encode_32(&p, 0);
+	if (tp->dedup_tier) {			/* v24 opts */
+		ceph_start_encoding(&p, 2, 1, 4 + 4 + 4 + 8);
+		ceph_encode_32(&p, 1);
+		ceph_encode_32(&p, 20);		/* DEDUP_TIER */
+		ceph_encode_32(&p, 1);		/* INT */
+		ceph_encode_64(&p, tp->dedup_tier);
+	} else {
+		ceph_start_encoding(&p, 2, 1, 4);
+		ceph_encode_32(&p, 0);
+	}
 	ceph_encode_32(&p, 0);			/* v25 */
 	ceph_encode_32(&p, 0);			/* v26 application_metadata */
 	ceph_encode_64(&p, 0);			/* v27 create_time */
@@ -330,6 +343,14 @@ static void pool_v35_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, test_decode_pool(test, &tp, &pi), -EINVAL);
 	tp.num_zones = 0;
 	KUNIT_EXPECT_EQ(test, test_decode_pool(test, &tp, &pi), -EINVAL);
+
+	/* nor a pool of size 0: the zone helpers divide by the zone size */
+	tp.num_zones = 1;
+	tp.size = 0;
+	tp.min_size = 1;
+	KUNIT_EXPECT_EQ(test, test_decode_pool(test, &tp, &pi), -EINVAL);
+	tp.v = 34;
+	KUNIT_EXPECT_EQ(test, test_decode_pool(test, &tp, &pi), -EINVAL);
 }
 
 /* Every cut short encoding is refused, without reading past the end. */
@@ -387,7 +408,8 @@ static void encode_crush_bucket(void **p, int id, int type, const int *items,
 		ceph_encode_32(p, item_weight);
 }
 
-static void encode_crush_rule(void **p, int ruleset, int type,
+/* min_size 1, as monitors encode rules for SERVER_QUINCY clients */
+static void encode_crush_rule(void **p, int ruleset, int type, int max_size,
 			      const int (*steps)[3], int n)
 {
 	int i;
@@ -397,7 +419,7 @@ static void encode_crush_rule(void **p, int ruleset, int type,
 	ceph_encode_8(p, ruleset);
 	ceph_encode_8(p, type);
 	ceph_encode_8(p, 1);			/* min_size */
-	ceph_encode_8(p, 20);			/* max_size */
+	ceph_encode_8(p, max_size);
 	for (i = 0; i < n; i++) {
 		ceph_encode_32(p, steps[i][0]);
 		ceph_encode_32(p, steps[i][1]);
@@ -413,7 +435,7 @@ static void encode_crush_name(void **p, int id, const char *name)
 }
 
 /* CrushWrapper::encode() of the map in osdmap_kunit.h */
-static void encode_crush(void **p)
+static void encode_crush(void **p, int max_size)
 {
 	static const int rep[][3] = {
 		{ CRUSH_RULE_TAKE, -1, 0 },
@@ -461,12 +483,12 @@ static void encode_crush(void **p)
 				    1 << 16);
 	}
 
-	encode_crush_rule(p, TEST_RULE_REP, CEPH_POOL_TYPE_REP, rep,
-			  ARRAY_SIZE(rep));
-	encode_crush_rule(p, TEST_RULE_EC, CEPH_POOL_TYPE_EC, ec,
-			  ARRAY_SIZE(ec));
-	encode_crush_rule(p, TEST_RULE_EC_ZONES, CEPH_POOL_TYPE_EC, ec_zones,
-			  ARRAY_SIZE(ec_zones));
+	encode_crush_rule(p, TEST_RULE_REP, CEPH_POOL_TYPE_REP, max_size,
+			  rep, ARRAY_SIZE(rep));
+	encode_crush_rule(p, TEST_RULE_EC, CEPH_POOL_TYPE_EC, max_size,
+			  ec, ARRAY_SIZE(ec));
+	encode_crush_rule(p, TEST_RULE_EC_ZONES, CEPH_POOL_TYPE_EC, max_size,
+			  ec_zones, ARRAY_SIZE(ec_zones));
 
 	ceph_encode_32(p, 4);			/* type names */
 	encode_crush_name(p, 0, "osd");
@@ -581,7 +603,7 @@ size_t ceph_kunit_encode_osdmap(void *buf, const struct test_osdmap *tm)
 
 	crush = p;
 	p += 4;
-	encode_crush(&p);
+	encode_crush(&p, tm->rule_max_size ?: 100);
 	put_unaligned_le32(p - crush - 4, crush);
 
 	ceph_encode_32(&p, 0);			/* erasure_code_profiles */
@@ -898,6 +920,31 @@ static void osdmap_crush_test(struct kunit *test)
 	ceph_osdmap_destroy(map);
 }
 
+/*
+ * CRUSH still picks a pool's rule by the pool's size.  Monitors encode
+ * every rule's sizes as 1 to 100 for SERVER_QUINCY clients; with the
+ * sizes a rule had before Quincy, a larger pool would get no OSDs.
+ */
+static void osdmap_crush_rule_size_test(struct kunit *test)
+{
+	struct test_osdmap *tm = ceph_kunit_osdmap_dup(test, &crush_map);
+	struct ceph_osdmap *map;
+	struct ceph_osds up, acting;
+
+	map = ceph_kunit_osdmap(test, tm);
+	test_up_acting(map, 3, 0, &up, &acting);
+	KUNIT_EXPECT_EQ(test, acting.size, 6);
+	ceph_osdmap_destroy(map);
+
+	tm->rule_max_size = 5;
+	map = ceph_kunit_osdmap(test, tm);
+	test_up_acting(map, 1, 0, &up, &acting);
+	KUNIT_EXPECT_EQ(test, acting.size, 3);
+	test_up_acting(map, 3, 0, &up, &acting);
+	KUNIT_EXPECT_EQ(test, acting.size, 0);
+	ceph_osdmap_destroy(map);
+}
+
 /* A down OSD leaves a hole in an EC set; an out one is replaced. */
 static void osdmap_crush_down_out_test(struct kunit *test)
 {
@@ -1028,6 +1075,7 @@ static struct kunit_case ceph_osdmap_test_cases[] = {
 	KUNIT_CASE(primaryfirst_pg_temp_test),
 	KUNIT_CASE(pg_upmap_primary_test),
 	KUNIT_CASE(osdmap_crush_test),
+	KUNIT_CASE(osdmap_crush_rule_size_test),
 	KUNIT_CASE(osdmap_crush_down_out_test),
 	KUNIT_CASE(osdmap_temp_test),
 	KUNIT_CASE(new_interval_test),

@@ -16,6 +16,7 @@ static void ec_direct_read_pool_test(struct kunit *test)
 			 CEPH_POOL_FLAG_CLIENT_SPLIT_READS,
 		.read_tier = -1,
 		.write_tier = -1,
+		.tier_of = -1,
 		.num_zones = 1,
 	};
 	struct ceph_osd_request_target t = {
@@ -46,9 +47,15 @@ static void ec_direct_read_pool_test(struct kunit *test)
 	pi.flags |= CEPH_POOL_FLAG_EIO;
 	KUNIT_EXPECT_FALSE(test, ec_direct_read_pool(&t, &pi));
 	pi.flags &= ~CEPH_POOL_FLAG_EIO;
-	pi.read_tier = 3;
+	pi.has_tiers = true;
 	KUNIT_EXPECT_FALSE(test, ec_direct_read_pool(&t, &pi));
-	pi.read_tier = -1;
+	pi.has_tiers = false;
+	pi.tier_of = 3;
+	KUNIT_EXPECT_FALSE(test, ec_direct_read_pool(&t, &pi));
+	pi.tier_of = -1;
+	pi.dedup_tier = 3;
+	KUNIT_EXPECT_FALSE(test, ec_direct_read_pool(&t, &pi));
+	pi.dedup_tier = 0;
 	pi.type = CEPH_POOL_TYPE_REP;
 	KUNIT_EXPECT_FALSE(test, ec_direct_read_pool(&t, &pi));
 }
@@ -61,6 +68,7 @@ static const struct ceph_pg_pool_info ec21_pool = {
 		 CEPH_POOL_FLAG_CLIENT_SPLIT_READS,
 	.read_tier = -1,
 	.write_tier = -1,
+	.tier_of = -1,
 	.stripe_width = 8192,
 	.ec_data_shard_count = 2,
 	.num_zones = 1,
@@ -460,6 +468,16 @@ static void test_free_versions(struct ceph_ec_split *sp)
 	kfree(sp);
 }
 
+/* A request that is never sent, to own a split read in pure tests */
+static struct ceph_osd_request *test_unsent_req(struct kunit *test)
+{
+	struct ceph_osd_request *req = kunit_kzalloc(test, sizeof(*req),
+						     GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, req);
+	return req;
+}
+
 static void ec_split_versions_test(struct kunit *test)
 {
 	static const int same[][3] = { { 0, 5, 1 }, { 1, 5, 1 }, { 2, 5, 1 } };
@@ -471,7 +489,7 @@ static void ec_split_versions_test(struct kunit *test)
 	struct ceph_ec_split *sp;
 	int i;
 
-	sp = alloc_ec_split(NULL, 4096, 3, 3);
+	sp = alloc_ec_split(test_unsent_req(test), 4096, 3, 3);
 	KUNIT_ASSERT_NOT_NULL(test, sp);
 	KUNIT_EXPECT_EQ(test, sp->num_subs, 3);
 
@@ -520,7 +538,7 @@ static void ec_split_versions_v1_test(struct kunit *test)
 	int i;
 
 	/* data from shards 0 and 1, only versions from the primary, shard 2 */
-	sp = alloc_ec_split(NULL, 4096, 2, 3);
+	sp = alloc_ec_split(test_unsent_req(test), 4096, 2, 3);
 	KUNIT_ASSERT_NOT_NULL(test, sp);
 	sp->v1 = true;
 	sp->ref = 2;
@@ -1023,6 +1041,38 @@ static void test_put(struct kunit *test, struct ceph_osd_request *req)
 	ceph_osdc_cancel_request(req);
 	test_drain(test, req->r_osdc);
 	ceph_osdc_put_request(req);
+}
+
+/*
+ * As in Objecter (pg_pool_t::allows_nonprimary_reads()), no direct reads
+ * from a pool that is a tier, has tiers or has a dedup tier.
+ */
+static void direct_read_tier_test(struct kunit *test)
+{
+	struct test_osdmap *tm = ceph_kunit_osdmap_dup(test, &client_map);
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_request *req;
+	struct ceph_osds acting;
+	struct ceph_pg pgid;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		tm->pools[1].tier_of = i == 0 ? TEST_POOL_REP : 0;
+		tm->pools[1].tier = i == 1 ? TEST_POOL_DST : 0;
+		tm->pools[1].dedup_tier = i == 2 ? TEST_POOL_DST : 0;
+		test_apply_map(test, osdc, tm);
+
+		test_acting(osdc, TEST_POOL_EC, "obj", &pgid, &acting);
+		req = test_read(test, osdc, TEST_POOL_EC, "obj",
+				CEPH_OSD_OP_READ, TEST_CHUNK, 1000,
+				CEPH_OSD_FLAG_BALANCE_READS);
+		ceph_osdc_start_request(osdc, req);
+		KUNIT_EXPECT_EQ_MSG(test, test_osd(req), acting.primary,
+				    "case %d", i);
+		KUNIT_EXPECT_FALSE(test,
+				   req->r_flags & CEPH_OSD_FLAG_EC_DIRECT_READ);
+		test_put(test, req);
+	}
 }
 
 /* Direct reads go to the shard's OSD, everything else to the primary. */
@@ -1639,6 +1689,107 @@ static void split_read_v1_test(struct kunit *test)
 	test_put(test, req);
 }
 
+/*
+ * Only GET_INTERNAL_VERSIONS_V2 failing with -EOPNOTSUPP shows an OSD
+ * without it; the read op failing so leaves the client on V2.
+ */
+static void split_read_opnotsupp_test(struct kunit *test)
+{
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_request *req;
+	struct ceph_ec_split *sp;
+	struct ceph_osds acting;
+	struct ceph_pg pgid;
+	int rvals[2] = { -EOPNOTSUPP };
+
+	test_acting(osdc, TEST_POOL_EC, "obj", &pgid, &acting);
+	req = test_split_read(test, osdc, CEPH_OSD_OP_READ);
+	sp = req->r_ec_split;
+	KUNIT_ASSERT_NOT_NULL(test, sp);
+	test_reply(test, sp->subs[0].req, -EOPNOTSUPP, rvals, NULL, NULL);
+	test_sub_error(test, sp, 1, -EIO);
+	KUNIT_EXPECT_FALSE(test, osdc->ec_split_v1);
+	KUNIT_EXPECT_EQ(test, test_osd(req), acting.primary);
+	test_put(test, req);
+}
+
+/*
+ * Fail sub-read @i of @sp from the completion workqueue, as libceph fails
+ * requests itself, while the caller holds osdc->lock for write as
+ * ceph_osdc_cancel_request() does.  Give the completion time to go as far
+ * as it can without osdc->lock.
+ */
+static void test_sub_fail_locked(struct ceph_ec_split *sp, int i, int err)
+{
+	struct ceph_osd_request *sreq = sp->subs[i].req;
+	struct ceph_osd *osd = sreq->r_osd;
+	struct ceph_osd_request *req = sp->req;
+
+	verify_osdc_wrlocked(req->r_osdc);
+	mutex_lock(&osd->lock);
+	complete_request(sreq, err);
+	mutex_unlock(&osd->lock);
+	wait_for_completion_timeout(&req->r_completion, HZ / 2);
+}
+
+/*
+ * A split read cancelled while its last sub-read fails: once
+ * ceph_osdc_cancel_request() returns, the read must not go on to the
+ * primary.
+ */
+static void split_read_cancel_fallback_test(struct kunit *test)
+{
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_request *req;
+	struct ceph_ec_split *sp;
+
+	req = test_split_read(test, osdc, CEPH_OSD_OP_READ);
+	sp = req->r_ec_split;
+	KUNIT_ASSERT_NOT_NULL(test, sp);
+	test_sub_error(test, sp, 0, -EIO);
+
+	down_write(&osdc->lock);
+	test_sub_fail_locked(sp, 1, -EIO);
+	if (req->r_osd)
+		cancel_request(req);
+	else if (req->r_ec_split)
+		ec_split_cancel(req);
+	up_write(&osdc->lock);
+	flush_workqueue(osdc->completion_wq);
+
+	KUNIT_EXPECT_EQ(test, test_osd(req), -1);
+	test_put(test, req);
+}
+
+/*
+ * A split read cancelled as its last sub-read completes it: between
+ * ceph_osdc_cancel_request() finding the split and ec_split_cancel()
+ * using it, the completion must not clear and free it.
+ */
+static void split_read_cancel_complete_test(struct kunit *test)
+{
+	struct ceph_osd_client *osdc = test_osdc(test, &client_map);
+	struct ceph_osd_request *req;
+	struct ceph_ec_split *sp;
+
+	req = test_split_read(test, osdc, CEPH_OSD_OP_READ);
+	sp = req->r_ec_split;
+	KUNIT_ASSERT_NOT_NULL(test, sp);
+	test_sub_error(test, sp, 0, -ENOENT);
+
+	down_write(&osdc->lock);
+	KUNIT_EXPECT_PTR_EQ(test, req->r_ec_split, sp);
+	test_sub_fail_locked(sp, 1, -ENOENT);
+	KUNIT_EXPECT_PTR_EQ(test, req->r_ec_split, sp);
+	if (req->r_ec_split == sp)
+		ec_split_cancel(req);
+	up_write(&osdc->lock);
+	flush_workqueue(osdc->completion_wq);
+
+	KUNIT_EXPECT_TRUE(test, completion_done(&req->r_completion));
+	test_put(test, req);
+}
+
 static void test_count_cb(struct ceph_osd_request *req)
 {
 	(*(int *)req->r_priv)++;
@@ -2223,6 +2374,47 @@ static void migration_redirect_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, test_route_new(test, tm, 1), TEST_POOL_DST);
 }
 
+/* A copy of @hoid as a reply decodes it, for the client to own */
+static struct ceph_hobject_id *test_hoid_dup(struct kunit *test,
+					     const struct ceph_hobject_id *hoid)
+{
+	struct ceph_hobject_id *dup = kzalloc_obj(*dup, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dup);
+	*dup = *hoid;
+	dup->key = NULL;
+	dup->key_len = 0;
+	dup->nspace = NULL;
+	dup->nspace_len = 0;
+	dup->oid = kmemdup(hoid->oid, hoid->oid_len, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dup->oid);
+	return dup;
+}
+
+/*
+ * Without memory to keep a PG's first watermark, the redirected request
+ * fails with -ENOMEM rather than going back to the source to be
+ * redirected again, and the other requests stay where they are.
+ */
+static void migration_wm_nomem_test(struct kunit *test)
+{
+	struct test_migration *tm = test_migration(test);
+	struct ceph_osd_client *osdc = tm->osdc;
+	struct ceph_osd_request *req = tm->reqs[0];
+	struct ceph_hobject_id *wm = test_hoid_dup(test, &tm->hoids[1]);
+
+	down_write(&osdc->lock);
+	handle_migration_redirect(osdc, req->r_osd, &req->r_t.spgid.pgid, wm,
+				  NULL, req->r_tid);
+	up_write(&osdc->lock);
+	flush_workqueue(osdc->completion_wq);
+
+	KUNIT_EXPECT_EQ(test, req->r_result, -ENOMEM);
+	KUNIT_EXPECT_EQ(test, tm->reqs[1]->r_tid, tm->tids[1]);
+	KUNIT_EXPECT_EQ(test, tm->reqs[2]->r_tid, tm->tids[2]);
+	KUNIT_EXPECT_EQ(test, test_route_new(test, tm, 0), TEST_POOL_REP);
+}
+
 /* Watches on the redirected OSD follow objects that have migrated. */
 static void migration_linger_test(struct kunit *test)
 {
@@ -2398,6 +2590,7 @@ static struct kunit_suite ceph_osd_client_test_suite = {
 
 static struct kunit_case ceph_osd_client_target_test_cases[] = {
 	KUNIT_CASE(direct_read_target_test),
+	KUNIT_CASE(direct_read_tier_test),
 	KUNIT_CASE(localize_zone_test),
 	KUNIT_CASE(balance_zones_test),
 	KUNIT_CASE(direct_read_pg_change_test),
@@ -2424,6 +2617,9 @@ static struct kunit_case ceph_osd_client_split_test_cases[] = {
 	KUNIT_CASE(split_read_migration_test),
 	KUNIT_CASE(version_read_test),
 	KUNIT_CASE(split_read_cancel_release_test),
+	KUNIT_CASE(split_read_opnotsupp_test),
+	KUNIT_CASE(split_read_cancel_fallback_test),
+	KUNIT_CASE(split_read_cancel_complete_test),
 	{}
 };
 
@@ -2446,6 +2642,7 @@ static struct kunit_suite ceph_osd_client_reply_test_suite = {
 
 static struct kunit_case ceph_osd_client_migration_test_cases[] = {
 	KUNIT_CASE(migration_redirect_test),
+	KUNIT_CASE(migration_wm_nomem_test),
 	KUNIT_CASE(migration_linger_test),
 	KUNIT_CASE(direct_read_migration_redirect_test),
 	KUNIT_CASE(pg_migrating_first_calc_test),
