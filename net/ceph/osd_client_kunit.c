@@ -182,7 +182,8 @@ static void ec_shard_bytes_test(struct kunit *test)
 			chunk - 5);
 	KUNIT_EXPECT_EQ(test, ec_shard_bytes(off, chunk, chunk, 2, 0), 5);
 	/* a stripe far into a large object */
-	KUNIT_EXPECT_EQ(test, ec_shard_bytes(1ULL << 40, 8 << 20, 1 << 20, 8, 7),
+	KUNIT_EXPECT_EQ(test,
+			ec_shard_bytes(1ULL << 40, 8 << 20, 1 << 20, 8, 7),
 			1 << 20);
 }
 
@@ -574,8 +575,8 @@ static void test_set_chunks(struct kunit *test, struct ec_split_sub *sub,
 	op->outdata_len = len;
 	for (c = raw; off < len; c += 2) {
 		u32 n = min_t(u32, 4096, len - off);
-		char *p = kmap_local_page(op->extent.osd_data.pages[off >>
-								    PAGE_SHIFT]);
+		struct page **pages = op->extent.osd_data.pages;
+		char *p = kmap_local_page(pages[off >> PAGE_SHIFT]);
 
 		memset(p + offset_in_page(off), 'A' + c, n);
 		kunmap_local(p);
@@ -592,7 +593,7 @@ static void ec_split_assemble_test(struct kunit *test)
 	struct ceph_osd_request *req = test_alloc_req(test, 1);
 	struct ceph_osd_req_op *op = &req->r_ops[0];
 	struct ceph_ec_split *sp;
-	int i;
+	int i, j;
 
 	sp = alloc_ec_split(req, 4096, 2, 2);
 	KUNIT_ASSERT_NOT_NULL(test, sp);
@@ -615,16 +616,20 @@ static void ec_split_assemble_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, len, expect);
 
 		for (off = 0; off < len; off += 512) {
-			char *p = kmap_local_page(op->extent.osd_data.pages[off >>
-								    PAGE_SHIFT]);
+			struct page **pages = op->extent.osd_data.pages;
+			char *p = kmap_local_page(pages[off >> PAGE_SHIFT]);
 			char got = p[offset_in_page(off)];
 
 			kunmap_local(p);
 			KUNIT_EXPECT_EQ_MSG(test, got, 'A' + (int)(off / 4096),
 					    "off %llu", off);
 		}
-		ceph_release_page_vector(sp->subs[0].req->r_ops[0].extent.osd_data.pages, 3);
-		ceph_release_page_vector(sp->subs[1].req->r_ops[0].extent.osd_data.pages, 3);
+		for (j = 0; j < 2; j++) {
+			struct ceph_osd_req_op *sop;
+
+			sop = &sp->subs[j].req->r_ops[0];
+			ceph_release_page_vector(sop->extent.osd_data.pages, 3);
+		}
 	}
 	ceph_release_page_vector(op->extent.osd_data.pages, 5);
 	kfree(sp);

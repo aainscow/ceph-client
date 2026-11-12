@@ -18,9 +18,11 @@ static void varint64_test(struct kunit *test)
 		{ { 0x7f }, 1, 127 },
 		{ { 0x80, 0x01 }, 2, 128 },
 		{ { 0xff, 0xff, 0x03 }, 3, 65535 },
-		{ { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 },
+		{ { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+		    0x01 },
 		  10, 1ULL << 63 },
-		{ { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 },
+		{ { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		    0x01 },
 		  10, U64_MAX },
 	};
 	int i;
@@ -142,7 +144,7 @@ static size_t encode_pool(void *buf, const struct test_pool *tp)
 	ceph_encode_64(&p, 0);			/* cache_min_*_age */
 	ceph_encode_32(&p, 0);			/* erasure_code_profile */
 	ceph_encode_32(&p, 0);			/* last_force_op_resend_pre* */
-	ceph_encode_32(&p, 0);			/* min_read_recency_for_promote */
+	ceph_encode_32(&p, 0);		/* min_read_recency_for_promote */
 	ceph_encode_64(&p, 0);			/* expected_num_objects */
 	ceph_encode_32(&p, 0);			/* v19 */
 	ceph_encode_32(&p, 0);			/* v20 */
@@ -491,7 +493,7 @@ static void encode_crush(void **p)
 
 	/* the tunables of a current map */
 	ceph_encode_32(p, 0);			/* choose_local_tries */
-	ceph_encode_32(p, 0);			/* choose_local_fallback_tries */
+	ceph_encode_32(p, 0);		/* choose_local_fallback_tries */
 	ceph_encode_32(p, 50);			/* choose_total_tries */
 	ceph_encode_32(p, 1);			/* chooseleaf_descend_once */
 	ceph_encode_8(p, 1);			/* chooseleaf_vary_r */
