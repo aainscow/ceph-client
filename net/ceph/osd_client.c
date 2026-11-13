@@ -1842,11 +1842,29 @@ out:
 	return 0;
 }
 
+/*
+ * Whether @pi's force resend epoch is this map's: the monitors set it on
+ * PG merges, among others.
+ */
+static bool pool_forces_resend(struct ceph_osd_client *osdc,
+			       struct ceph_osd_request_target *t,
+			       const struct ceph_pg_pool_info *pi)
+{
+	if (osdc->osdmap->epoch != pi->last_force_request_resend)
+		return false;
+
+	if (t->last_force_resend < pi->last_force_request_resend) {
+		t->last_force_resend = pi->last_force_request_resend;
+		return true;
+	}
+	return !t->last_force_resend;
+}
+
 static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 					   struct ceph_osd_request_target *t,
 					   bool any_change)
 {
-	struct ceph_pg_pool_info *pi;
+	struct ceph_pg_pool_info *pi, *tier_pi;
 	struct ceph_pg pgid, last_pgid;
 	struct ceph_osds up, acting;
 	bool should_be_paused;
@@ -1870,14 +1888,8 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		goto out;
 	}
 
-	if (osdc->osdmap->epoch == pi->last_force_request_resend) {
-		if (t->last_force_resend < pi->last_force_request_resend) {
-			t->last_force_resend = pi->last_force_request_resend;
-			force_resend = true;
-		} else if (t->last_force_resend == 0) {
-			force_resend = true;
-		}
-	}
+	if (pool_forces_resend(osdc, t, pi))
+		force_resend = true;
 
 	/* apply tiering */
 	ceph_oid_copy(&t->target_oid, &t->base_oid);
@@ -1896,11 +1908,15 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 		}
 	}
 
+	tier_pi = pi;
 	if (calc_migration_target(osdc, t, &pi)) {
 		t->osd = CEPH_HOMELESS_OSD;
 		ct_res = CALC_TARGET_POOL_DNE;
 		goto out;
 	}
+	/* PG merges in the pool the request has migrated to, for one */
+	if (pi != tier_pi && pool_forces_resend(osdc, t, pi))
+		force_resend = true;
 
 	__ceph_object_locator_to_pg(pi, &t->target_oid, &t->target_oloc, &pgid);
 	last_pgid.pool = pgid.pool;
