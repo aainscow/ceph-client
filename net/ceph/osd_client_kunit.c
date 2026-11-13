@@ -2415,6 +2415,51 @@ static void migration_wm_nomem_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, test_route_new(test, tm, 0), TEST_POOL_REP);
 }
 
+/*
+ * A PG merge in the pool that a finished migration sends requests to.  The
+ * merge target is on the merge source's OSDs (pgp_num is reduced first),
+ * which drop requests for the source, so the request moves only because
+ * the monitors force a resend in that pool (last_force_op_resend_prenautilus).
+ */
+static void migration_merge_test(struct kunit *test)
+{
+	struct test_osdmap *tm = ceph_kunit_osdmap_dup(test, &client_map);
+	struct ceph_osd_client *osdc;
+	struct ceph_osd_request *req;
+	struct ceph_osds acting, merged;
+	struct ceph_pg pgid;
+	char name[16];
+	int i;
+
+	tm->pools[0].migration_target = TEST_POOL_DST;
+	tm->pools[3].migration_root = TEST_POOL_REP;
+	tm->pools[3].pgp_num = 4;
+	osdc = test_osdc(test, tm);
+	for (i = 0; i < 256; i++) {
+		snprintf(name, sizeof(name), "o%d", i);
+		test_acting(osdc, TEST_POOL_DST, name, &pgid, &acting);
+		if (pgid.seed == 7)
+			break;
+	}
+	KUNIT_ASSERT_LT(test, i, 256);
+	req = test_read(test, osdc, TEST_POOL_REP, name, CEPH_OSD_OP_READ, 0,
+			100, 0);
+	ceph_osdc_start_request(osdc, req);
+	KUNIT_ASSERT_EQ(test, req->r_t.target_oloc.pool, TEST_POOL_DST);
+	KUNIT_ASSERT_EQ(test, req->r_t.spgid.pgid.seed, 7);
+
+	/* PG 7 merges into PG 3 */
+	tm->pools[3].pg_num = 7;
+	tm->pools[3].last_force_resend = osdc->osdmap->epoch + 1;
+	test_apply_map(test, osdc, tm);
+	test_acting(osdc, TEST_POOL_DST, name, &pgid, &merged);
+	KUNIT_ASSERT_EQ(test, pgid.seed, 3);
+	KUNIT_ASSERT_EQ(test, merged.primary, acting.primary);
+	KUNIT_EXPECT_EQ(test, req->r_attempts, 2);
+	KUNIT_EXPECT_EQ(test, req->r_t.spgid.pgid.seed, 3);
+	test_put(test, req);
+}
+
 /* Watches on the redirected OSD follow objects that have migrated. */
 static void migration_linger_test(struct kunit *test)
 {
@@ -2646,6 +2691,7 @@ static struct kunit_case ceph_osd_client_migration_test_cases[] = {
 	KUNIT_CASE(migration_linger_test),
 	KUNIT_CASE(direct_read_migration_redirect_test),
 	KUNIT_CASE(pg_migrating_first_calc_test),
+	KUNIT_CASE(migration_merge_test),
 	{}
 };
 
