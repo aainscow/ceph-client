@@ -83,6 +83,17 @@ static int osdmap_show(struct seq_file *s, void *p)
 			   pi->pg_num, pi->pg_num_mask, pi->flags,
 			   pi->last_force_request_resend, pi->read_tier,
 			   pi->write_tier);
+		if (pi->migration_src < 0 && pi->migration_target < 0 &&
+		    pi->migration_root < 0)
+			continue;
+
+		seq_printf(s, "pool_migration %lld src %lld target %lld root %lld lowest_migrated_pg %x migrating_pgs [",
+			   pi->id, pi->migration_src, pi->migration_target,
+			   pi->migration_root, pi->lowest_migrated_pg);
+		for (i = 0; i < pi->num_migrating_pgs; i++)
+			seq_printf(s, "%s%x", (i == 0 ? "" : ","),
+				   pi->migrating_pgs[i]);
+		seq_puts(s, "]\n");
 	}
 	for (i = 0; i < map->max_osd; i++) {
 		struct ceph_entity_addr *addr = &map->osd_addr[i];
@@ -137,6 +148,13 @@ static int osdmap_show(struct seq_file *s, void *p)
 				   pg->pg_upmap_items.from_to[i][0],
 				   pg->pg_upmap_items.from_to[i][1]);
 		seq_printf(s, "]\n");
+	}
+	for (n = rb_first(&map->pg_upmap_primaries); n; n = rb_next(n)) {
+		struct ceph_pg_mapping *pg =
+			rb_entry(n, struct ceph_pg_mapping, node);
+
+		seq_printf(s, "pg_upmap_primary %llu.%x %d\n", pg->pgid.pool,
+			   pg->pgid.seed, pg->pg_upmap_primary.osd);
 	}
 
 out_unlock:
@@ -363,6 +381,11 @@ static int osdc_show(struct seq_file *s, void *pp)
 	struct rb_node *n;
 
 	down_read(&osdc->lock);
+	seq_printf(s, "EC_DIRECT_READS %lld eagain %lld split %lld fallback %lld\n",
+		   atomic64_read(&osdc->ec_direct_reads),
+		   atomic64_read(&osdc->ec_direct_eagain),
+		   atomic64_read(&osdc->ec_split_reads),
+		   atomic64_read(&osdc->ec_split_fallbacks));
 	seq_printf(s, "REQUESTS %d homeless %d\n",
 		   atomic_read(&osdc->num_requests),
 		   atomic_read(&osdc->num_homeless));

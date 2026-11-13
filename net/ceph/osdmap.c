@@ -808,7 +808,127 @@ static void __remove_pg_pool(struct rb_root *root, struct ceph_pg_pool_info *pi)
 {
 	erase_pg_pool(root, pi);
 	kfree(pi->name);
+	kfree(pi->migrating_pgs);
 	kfree(pi);
+}
+
+/* shard_id_set: two varint-encoded words */
+static int decode_shard_id_set(void **p, void *end, unsigned long *bits)
+{
+	u64 words[CEPH_POOL_MAX_SHARDS / 64];
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(words); i++) {
+		ret = ceph_decode_varint64(p, end, &words[i]);
+		if (ret)
+			return ret;
+	}
+	bitmap_from_arr64(bits, words, CEPH_POOL_MAX_SHARDS);
+	return 0;
+}
+
+static int decode_optional_pool_id(void **p, void *end, s64 *id)
+{
+	u8 present;
+
+	ceph_decode_8_safe(p, end, present, e_inval);
+	if (present)
+		ceph_decode_64_safe(p, end, *id, e_inval);
+	else
+		*id = -1;
+	return 0;
+
+e_inval:
+	return -EINVAL;
+}
+
+static int decode_migrating_pgs(void **p, void *end,
+				struct ceph_pg_pool_info *pi)
+{
+	u32 *pgs = NULL;
+	u32 len, i;
+	int ret;
+
+	ceph_decode_32_safe(p, end, len, e_inval);
+	if (len) {
+		pgs = kmalloc_array(len, sizeof(*pgs), GFP_NOIO);
+		if (!pgs)
+			return -ENOMEM;
+	}
+	for (i = 0; i < len; i++) {
+		struct ceph_pg pgid;
+
+		ret = ceph_decode_pgid(p, end, &pgid);
+		if (ret) {
+			kfree(pgs);
+			return ret;
+		}
+		pgs[i] = pgid.seed;
+	}
+
+	kfree(pi->migrating_pgs);
+	pi->migrating_pgs = pgs;
+	pi->num_migrating_pgs = len;
+	return 0;
+
+e_inval:
+	return -EINVAL;
+}
+
+/* pool_opts_t::type_t, and the one option the client needs */
+#define POOL_OPT_STR		0
+#define POOL_OPT_INT		1
+#define POOL_OPT_DOUBLE		2
+#define POOL_OPT_DEDUP_TIER	20
+
+static int decode_pool_opts(void **p, void *end, struct ceph_pg_pool_info *pi)
+{
+	u8 struct_v;
+	u32 struct_len, n;
+	void *opts_end;
+	int ret;
+
+	ret = ceph_start_decoding(p, end, 2, "pool_opts_t", &struct_v,
+				  &struct_len);
+	if (ret)
+		return ret;
+
+	opts_end = *p + struct_len;
+	ceph_decode_32_safe(p, opts_end, n, e_inval);
+	while (n--) {
+		s32 key, type, val32;
+		s64 val;
+
+		ceph_decode_32_safe(p, opts_end, key, e_inval);
+		ceph_decode_32_safe(p, opts_end, type, e_inval);
+		switch (type) {
+		case POOL_OPT_STR:
+			ceph_decode_skip_string(p, opts_end, e_inval);
+			break;
+		case POOL_OPT_INT:
+			if (struct_v >= 2) {
+				ceph_decode_64_safe(p, opts_end, val, e_inval);
+			} else {
+				ceph_decode_32_safe(p, opts_end, val32,
+						    e_inval);
+				val = val32;
+			}
+			if (key == POOL_OPT_DEDUP_TIER)
+				pi->dedup_tier = val;
+			break;
+		case POOL_OPT_DOUBLE:
+			ceph_decode_skip_64(p, opts_end, e_inval);
+			break;
+		default:
+			goto e_inval;
+		}
+	}
+
+	*p = opts_end;
+	return 0;
+
+e_inval:
+	return -EINVAL;
 }
 
 static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
@@ -816,6 +936,7 @@ static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
 	u8 ev, cv;
 	unsigned len, num;
 	void *pool_end;
+	int ret;
 
 	ceph_decode_need(p, end, 2 + 4, bad);
 	ev = ceph_decode_8(p);  /* encoding version */
@@ -873,15 +994,19 @@ static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
 		ceph_decode_skip_n(p, end, 8 + 8, bad);
 
 	if (ev >= 9) {
-		/* tiers */
-		ceph_decode_skip_set(p, end, 64, bad);
+		ceph_decode_32_safe(p, end, num, bad);
+		pi->has_tiers = num;
+		while (num--)
+			ceph_decode_skip_64(p, end, bad);  /* tiers */
 
 		ceph_decode_need(p, end, 8 + 1 + 8 + 8, bad);
-		*p += 8;  /* skip tier_of */
+		pi->tier_of = ceph_decode_64(p);
 		*p += 1;  /* skip cache_mode */
 		pi->read_tier = ceph_decode_64(p);
 		pi->write_tier = ceph_decode_64(p);
 	} else {
+		pi->has_tiers = false;
+		pi->tier_of = -1;
 		pi->read_tier = -1;
 		pi->write_tier = -1;
 	}
@@ -900,8 +1025,9 @@ static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
 	}
 
 	if (ev >= 12)
-		/* stripe_width */
-		ceph_decode_skip_32(p, end, bad);
+		ceph_decode_32_safe(p, end, pi->stripe_width, bad);
+	else
+		pi->stripe_width = 0;
 
 	if (ev >= 13)
 		/* target_max_*, cache_target_*, cache_min_* */
@@ -948,14 +1074,126 @@ static int decode_pool(void **p, void *end, struct ceph_pg_pool_info *pi)
 		/* hit_set_grade_decay_rate, hit_set_search_last_n */
 		ceph_decode_skip_n(p, end, 4 + 4, bad);
 
+	pi->dedup_tier = 0;
 	if (ev >= 24) {
-		/* opts (with versions) */
-		ceph_decode_skip_n(p, end, 2, bad);
-		ceph_decode_skip_string(p, end, bad);
+		ret = decode_pool_opts(p, end, pi);
+		if (ret)
+			return ret;
 	}
 
 	if (ev >= 25)
 		ceph_decode_32_safe(p, end, pi->last_force_request_resend, bad);
+
+	if (ev >= 26)
+		/* application_metadata */
+		ceph_decode_skip_map_of_map(p, end, string, string, string,
+					    bad);
+
+	if (ev >= 27)
+		/* create_time */
+		ceph_decode_skip_64(p, end, bad);
+
+	if (ev >= 28)
+		/*
+		 * pg_num_target, pgp_num_target, pg_num_pending,
+		 * old_merge_last_epoch_started, old_merge_last_epoch_clean,
+		 * last_force_op_resend, pg_autoscale_mode
+		 */
+		ceph_decode_skip_n(p, end, 6 * 4 + 1, bad);
+
+	if (ev >= 29) {
+		/* last_pg_merge_meta (with versions) */
+		ceph_decode_skip_n(p, end, 2, bad);
+		ceph_decode_skip_string(p, end, bad);
+	}
+
+	if (ev == 30)
+		/* peering_crush_* */
+		ceph_decode_skip_n(p, end, 4 * 4, bad);
+
+	if (ev >= 31) {
+		u8 present;
+
+		/* peering_crush_* */
+		ceph_decode_8_safe(p, end, present, bad);
+		if (present)
+			ceph_decode_skip_n(p, end, 4 * 4, bad);
+	}
+
+	if (ev >= 32) {
+		ret = decode_shard_id_set(p, end, pi->nonprimary_shards);
+		if (ret)
+			return ret;
+	} else {
+		bitmap_zero(pi->nonprimary_shards, CEPH_POOL_MAX_SHARDS);
+	}
+
+	if (ev >= 33) {
+		u8 present;
+
+		ceph_decode_32_safe(p, end, pi->shard_mapping_len, bad);
+		ceph_decode_need(p, end, pi->shard_mapping_len, bad);
+		if (pi->shard_mapping_len <= CEPH_PG_MAX_SIZE)
+			ceph_decode_copy(p, pi->shard_mapping,
+					 pi->shard_mapping_len);
+		else
+			*p += pi->shard_mapping_len;
+
+		ceph_decode_8_safe(p, end, present, bad);
+		if (present)
+			ceph_decode_8_safe(p, end, pi->ec_data_shard_count,
+					   bad);
+		else
+			pi->ec_data_shard_count = 0;
+
+		/* ec_coding_shard_count */
+		ceph_decode_8_safe(p, end, present, bad);
+		if (present)
+			ceph_decode_skip_8(p, end, bad);
+	} else {
+		pi->shard_mapping_len = 0;
+		pi->ec_data_shard_count = 0;
+	}
+
+	if (ev >= 34) {
+		ret = decode_optional_pool_id(p, end, &pi->migration_src);
+		if (ret)
+			return ret;
+
+		ret = decode_optional_pool_id(p, end, &pi->migration_target);
+		if (ret)
+			return ret;
+
+		ret = decode_migrating_pgs(p, end, pi);
+		if (ret)
+			return ret;
+
+		ceph_decode_32_safe(p, end, pi->lowest_migrated_pg, bad);
+
+		ret = decode_optional_pool_id(p, end, &pi->migration_root);
+		if (ret)
+			return ret;
+	} else {
+		pi->migration_src = -1;
+		pi->migration_target = -1;
+		pi->migration_root = -1;
+		kfree(pi->migrating_pgs);
+		pi->migrating_pgs = NULL;
+		pi->num_migrating_pgs = 0;
+		pi->lowest_migrated_pg = 0;
+	}
+
+	if (ev >= 35) {
+		/* replica */
+		ceph_decode_skip_8(p, end, bad);
+
+		ceph_decode_8_safe(p, end, pi->num_zones, bad);
+	} else {
+		pi->num_zones = 1;
+	}
+	/* ceph_pool_zone_size() divides by the zone size */
+	if (!pi->size || !pi->num_zones || pi->size % pi->num_zones)
+		goto bad;
 
 	/* ignore the rest */
 
@@ -1152,6 +1390,7 @@ struct ceph_osdmap *ceph_osdmap_alloc(void)
 	map->primary_temp = RB_ROOT;
 	map->pg_upmap = RB_ROOT;
 	map->pg_upmap_items = RB_ROOT;
+	map->pg_upmap_primaries = RB_ROOT;
 
 	init_workspace_manager(&map->crush_wsm);
 
@@ -1192,6 +1431,13 @@ void ceph_osdmap_destroy(struct ceph_osdmap *map)
 			rb_entry(rb_first(&map->pg_upmap_items),
 				 struct ceph_pg_mapping, node);
 		rb_erase(&pg->node, &map->pg_upmap_items);
+		kfree(pg);
+	}
+	while (!RB_EMPTY_ROOT(&map->pg_upmap_primaries)) {
+		struct ceph_pg_mapping *pg =
+			rb_entry(rb_first(&map->pg_upmap_primaries),
+				 struct ceph_pg_mapping, node);
+		rb_erase(&pg->node, &map->pg_upmap_primaries);
 		kfree(pg);
 	}
 	while (!RB_EMPTY_ROOT(&map->pg_pools)) {
@@ -1678,6 +1924,45 @@ static int decode_old_pg_upmap_items(void **p, void *end,
 	return decode_pg_mapping(p, end, &map->pg_upmap_items, NULL, true);
 }
 
+static struct ceph_pg_mapping *__decode_pg_upmap_primary(void **p, void *end,
+							 bool __unused)
+{
+	struct ceph_pg_mapping *pg;
+	u32 osd;
+
+	ceph_decode_32_safe(p, end, osd, e_inval);
+	pg = alloc_pg_mapping(0);
+	if (!pg)
+		return ERR_PTR(-ENOMEM);
+
+	pg->pg_upmap_primary.osd = osd;
+	return pg;
+
+e_inval:
+	return ERR_PTR(-EINVAL);
+}
+
+static int decode_pg_upmap_primaries(void **p, void *end,
+				     struct ceph_osdmap *map)
+{
+	return decode_pg_mapping(p, end, &map->pg_upmap_primaries,
+				 __decode_pg_upmap_primary, false);
+}
+
+static int decode_new_pg_upmap_primaries(void **p, void *end,
+					 struct ceph_osdmap *map)
+{
+	return decode_pg_mapping(p, end, &map->pg_upmap_primaries,
+				 __decode_pg_upmap_primary, true);
+}
+
+static int decode_old_pg_upmap_primaries(void **p, void *end,
+					 struct ceph_osdmap *map)
+{
+	return decode_pg_mapping(p, end, &map->pg_upmap_primaries, NULL,
+				 true);
+}
+
 /*
  * decode a full map.
  */
@@ -1810,6 +2095,28 @@ static int osdmap_decode(void **p, void *end, bool msgr2,
 	} else {
 		WARN_ON(!RB_EMPTY_ROOT(&map->pg_upmap));
 		WARN_ON(!RB_EMPTY_ROOT(&map->pg_upmap_items));
+	}
+
+	if (struct_v >= 6)
+		/* crush_version */
+		ceph_decode_skip_32(p, end, e_inval);
+
+	if (struct_v >= 7) {
+		/* new_removed_snaps, new_purged_snaps */
+		ceph_decode_skip_map_of_map(p, end, 64, 64, 64, e_inval);
+		ceph_decode_skip_map_of_map(p, end, 64, 64, 64, e_inval);
+	}
+
+	if (struct_v >= 9)
+		/* last_up_change, last_in_change */
+		ceph_decode_skip_n(p, end, 8 + 8, e_inval);
+
+	if (struct_v >= 10) {
+		err = decode_pg_upmap_primaries(p, end, map);
+		if (err)
+			goto bad;
+	} else {
+		WARN_ON(!RB_EMPTY_ROOT(&map->pg_upmap_primaries));
 	}
 
 	/* ignore the rest */
@@ -2127,6 +2434,26 @@ struct ceph_osdmap *osdmap_apply_incremental(void **p, void *end, bool msgr2,
 			goto bad;
 	}
 
+	if (struct_v >= 6) {
+		/* new_removed_snaps, new_purged_snaps */
+		ceph_decode_skip_map_of_map(p, end, 64, 64, 64, e_inval);
+		ceph_decode_skip_map_of_map(p, end, 64, 64, 64, e_inval);
+	}
+
+	if (struct_v >= 8)
+		/* new_last_up_change, new_last_in_change */
+		ceph_decode_skip_n(p, end, 8 + 8, e_inval);
+
+	if (struct_v >= 9) {
+		err = decode_new_pg_upmap_primaries(p, end, map);
+		if (err)
+			goto bad;
+
+		err = decode_old_pg_upmap_primaries(p, end, map);
+		if (err)
+			goto bad;
+	}
+
 	/* ignore the rest */
 	*p = end;
 
@@ -2372,6 +2699,12 @@ bool ceph_is_new_interval(const struct ceph_osds *old_acting,
 			  bool new_sort_bitwise,
 			  bool old_recovery_deletes,
 			  bool new_recovery_deletes,
+			  bool old_ec_optimizations,
+			  bool new_ec_optimizations,
+			  bool old_pg_migrating,
+			  bool new_pg_migrating,
+			  bool old_pool_pgs_migrating,
+			  bool new_pool_pgs_migrating,
 			  const struct ceph_pg *pgid)
 {
 	return !osds_equal(old_acting, new_acting) ||
@@ -2380,7 +2713,10 @@ bool ceph_is_new_interval(const struct ceph_osds *old_acting,
 	       old_min_size != new_min_size ||
 	       ceph_pg_is_split(pgid, old_pg_num, new_pg_num) ||
 	       old_sort_bitwise != new_sort_bitwise ||
-	       old_recovery_deletes != new_recovery_deletes;
+	       old_recovery_deletes != new_recovery_deletes ||
+	       old_ec_optimizations != new_ec_optimizations ||
+	       old_pg_migrating != new_pg_migrating ||
+	       old_pool_pgs_migrating != new_pool_pgs_migrating;
 }
 
 static int calc_pg_rank(int osd, const struct ceph_osds *acting)
@@ -2690,6 +3026,23 @@ static void apply_upmap(struct ceph_osdmap *osdmap,
 				raw->osds[pos] = to;
 		}
 	}
+
+	pg = lookup_pg_mapping(&osdmap->pg_upmap_primaries, pgid);
+	if (pg) {
+		int osd = pg->pg_upmap_primary.osd;
+
+		/* make sure the new primary isn't marked out */
+		if (osd >= 0 && osd < osdmap->max_osd &&
+		    osdmap->osd_weight[osd] != 0) {
+			for (i = 1; i < raw->size; i++) {
+				if (raw->osds[i] == osd) {
+					raw->osds[i] = raw->osds[0];
+					raw->osds[0] = osd;
+					break;
+				}
+			}
+		}
+	}
 }
 
 /*
@@ -2803,6 +3156,29 @@ static void apply_primary_affinity(struct ceph_osdmap *osdmap,
 }
 
 /*
+ * Optimized EC pools keep pg_temp with the shards that can be primary
+ * first and the non-primary shards after them.
+ */
+static bool is_nonprimary_shard(struct ceph_pg_pool_info *pi, int shard)
+{
+	return test_bit(ceph_pool_relative_shard(pi, shard),
+			pi->nonprimary_shards);
+}
+
+static int num_nonprimary_shards(struct ceph_pg_pool_info *pi)
+{
+	return pi->num_zones * bitmap_weight(pi->nonprimary_shards,
+					     ceph_pool_zone_size(pi));
+}
+
+static bool is_primaryfirst_pg_temp(struct ceph_pg_pool_info *pi,
+				    struct ceph_pg_mapping *pg)
+{
+	return (pi->flags & CEPH_POOL_FLAG_EC_OPTIMIZATIONS) &&
+	       !ceph_can_shift_osds(pi) && pg->pg_temp.len == pi->size;
+}
+
+/*
  * Get pg_temp and primary_temp mappings for given PG.
  *
  * Note that a PG may have none, only pg_temp, only primary_temp or
@@ -2839,6 +3215,20 @@ static void get_temp_osds(struct ceph_osdmap *osdmap,
 			if (temp->osds[i] != CRUSH_ITEM_NONE) {
 				temp->primary = temp->osds[i];
 				break;
+			}
+		}
+
+		/* back to shard order */
+		if (is_primaryfirst_pg_temp(pi, pg)) {
+			struct ceph_osds pf = *temp;
+			int primary = 0;
+			int nonprimary = pf.size - num_nonprimary_shards(pi);
+
+			for (i = 0; i < pf.size; i++) {
+				if (is_nonprimary_shard(pi, i))
+					temp->osds[i] = pf.osds[nonprimary++];
+				else
+					temp->osds[i] = pf.osds[primary++];
 			}
 		}
 	}
@@ -2890,6 +3280,9 @@ bool ceph_pg_to_primary_shard(struct ceph_osdmap *osdmap,
 {
 	struct ceph_pg pgid;
 	struct ceph_osds up, acting;
+	struct ceph_pg_mapping *pg;
+	bool primaryfirst;
+	int shard = -1;
 	int i;
 
 	WARN_ON(pi->id != raw_pgid->pool);
@@ -2902,15 +3295,29 @@ bool ceph_pg_to_primary_shard(struct ceph_osdmap *osdmap,
 	}
 
 	ceph_pg_to_up_acting_osds(osdmap, pi, &pgid, &up, &acting);
+
+	/*
+	 * With a primary-first pg_temp, an OSD with several shards is the
+	 * primary for its first shard that can be primary.
+	 */
+	pg = lookup_pg_mapping(&osdmap->pg_temp, &pgid);
+	primaryfirst = pg && is_primaryfirst_pg_temp(pi, pg);
 	for (i = 0; i < acting.size; i++) {
-		if (acting.osds[i] == acting.primary) {
-			spgid->pgid = pgid; /* struct */
-			spgid->shard = i;
-			return true;
+		if (acting.osds[i] != acting.primary)
+			continue;
+		if (shard < 0)
+			shard = i;
+		if (!primaryfirst || !is_nonprimary_shard(pi, i)) {
+			shard = i;
+			break;
 		}
 	}
+	if (shard < 0)
+		return false;
 
-	return false;
+	spgid->pgid = pgid; /* struct */
+	spgid->shard = shard;
+	return true;
 }
 
 /*
@@ -3151,3 +3558,7 @@ int ceph_get_crush_locality(struct ceph_osdmap *osdmap, int id,
 			return type_id;
 	}
 }
+
+#if IS_ENABLED(CONFIG_CEPH_LIB_KUNIT_TEST)
+#include "osdmap_kunit.c"
+#endif

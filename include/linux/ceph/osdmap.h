@@ -2,6 +2,7 @@
 #ifndef _FS_CEPH_OSDMAP_H
 #define _FS_CEPH_OSDMAP_H
 
+#include <linux/bitmap.h>
 #include <linux/rbtree.h>
 #include <linux/ceph/types.h>
 #include <linux/ceph/decode.h>
@@ -40,6 +41,12 @@ int ceph_spg_compare(const struct ceph_spg *lhs, const struct ceph_spg *rhs);
 #define CEPH_POOL_FLAG_FULL_QUOTA	(1ULL << 10) /* pool ran out of quota,
 							will set FULL too */
 #define CEPH_POOL_FLAG_NEARFULL		(1ULL << 11) /* pool is nearfull */
+#define CEPH_POOL_FLAG_EIO		(1ULL << 16) /* fail all ops with EIO */
+#define CEPH_POOL_FLAG_CRIMSON		(1ULL << 18) /* crimson OSDs */
+#define CEPH_POOL_FLAG_EC_OPTIMIZATIONS	(1ULL << 19) /* optimized EC */
+#define CEPH_POOL_FLAG_CLIENT_SPLIT_READS (1ULL << 20) /* EC direct reads */
+
+#define CEPH_POOL_MAX_SHARDS		128 /* shard_id_set */
 
 struct ceph_pg_pool_info {
 	struct rb_node node;
@@ -54,11 +61,41 @@ struct ceph_pg_pool_info {
 	int pg_num_mask, pgp_num_mask;
 	s64 read_tier;
 	s64 write_tier; /* wins for read+write ops */
+	s64 tier_of;	/* the base pool of a tier, -1 if none */
+	s64 dedup_tier;	/* 0 if none */
+	bool has_tiers;
 	u64 flags; /* CEPH_POOL_FLAG_* */
 	char *name;
+	u32 stripe_width;
+
+	DECLARE_BITMAP(nonprimary_shards, CEPH_POOL_MAX_SHARDS);
+	u32 shard_mapping_len;
+	s8 shard_mapping[CEPH_PG_MAX_SIZE];
+	u8 ec_data_shard_count; /* 0 if not set */
+
+	s64 migration_src; /* -1 if none */
+	s64 migration_target; /* ditto */
+	s64 migration_root; /* ditto */
+	u32 *migrating_pgs; /* PG seeds, ascending */
+	u32 num_migrating_pgs;
+	u32 lowest_migrated_pg;
+
+	u8 num_zones;
 
 	bool was_full;  /* for handle_one_map() */
 };
+
+static inline int ceph_pool_zone_size(const struct ceph_pg_pool_info *pi)
+{
+	return pi->size / pi->num_zones;
+}
+
+/* The position of @shard within its zone. */
+static inline int ceph_pool_relative_shard(const struct ceph_pg_pool_info *pi,
+					   int shard)
+{
+	return shard % ceph_pool_zone_size(pi);
+}
 
 static inline bool ceph_can_shift_osds(struct ceph_pg_pool_info *pool)
 {
@@ -159,7 +196,7 @@ struct ceph_pg_mapping {
 		} pg_temp, pg_upmap;
 		struct {
 			int osd;
-		} primary_temp;
+		} primary_temp, pg_upmap_primary;
 		struct {
 			int len;
 			int from_to[][2];
@@ -185,6 +222,7 @@ struct ceph_osdmap {
 	/* remap (post-CRUSH, pre-up) */
 	struct rb_root pg_upmap;	/* PG := raw set */
 	struct rb_root pg_upmap_items;	/* from -> to within raw set */
+	struct rb_root pg_upmap_primaries;	/* PG := primary */
 
 	u32 *osd_primary_affinity;
 
@@ -286,6 +324,12 @@ bool ceph_is_new_interval(const struct ceph_osds *old_acting,
 			  bool new_sort_bitwise,
 			  bool old_recovery_deletes,
 			  bool new_recovery_deletes,
+			  bool old_ec_optimizations,
+			  bool new_ec_optimizations,
+			  bool old_pg_migrating,
+			  bool new_pg_migrating,
+			  bool old_pool_pgs_migrating,
+			  bool new_pool_pgs_migrating,
 			  const struct ceph_pg *pgid);
 bool ceph_osds_changed(const struct ceph_osds *old_acting,
 		       const struct ceph_osds *new_acting,

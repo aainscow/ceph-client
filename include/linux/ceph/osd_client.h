@@ -19,6 +19,8 @@
 
 struct ceph_msg;
 struct ceph_snap_context;
+struct ceph_hobject_id;
+struct ceph_ec_split;
 struct ceph_osd_request;
 struct ceph_osd_client;
 
@@ -47,6 +49,7 @@ enum ceph_sparse_read_state {
 	CEPH_SPARSE_READ_DATA_LEN,
 	CEPH_SPARSE_READ_DATA_PRE,
 	CEPH_SPARSE_READ_DATA,
+	CEPH_SPARSE_READ_PLAIN,
 };
 
 /*
@@ -69,6 +72,9 @@ struct ceph_sparse_read {
 	u32				sr_count;    /* extent count in reply */
 	int				sr_ext_len;  /* length of extent array */
 	struct ceph_sparse_extent	*sr_extent;  /* extent array */
+	u64				sr_plain_cap; /* plain op buffer size */
+	u32				sr_plain_len; /* plain op data size */
+	bool				sr_plain;     /* current op is plain */
 };
 
 /*
@@ -222,9 +228,15 @@ struct ceph_osd_request_target {
 	int min_size;
 	bool sort_bitwise;
 	bool recovery_deletes;
+	bool ec_optimizations;
+	bool pg_migrating;
+	bool pool_pgs_migrating;
 
 	unsigned int flags;                /* CEPH_OSD_FLAG_* */
 	bool used_replica;
+	u64 ec_read_off;                   /* the read of a 1-op request */
+	u64 ec_read_len;                   /* ditto */
+	int ec_forced_shard;               /* for CEPH_OSD_FLAG_FORCE_OSD */
 	bool paused;
 
 	u32 epoch;
@@ -279,12 +291,15 @@ struct ceph_osd_request {
 	ktime_t r_end_latency;                /* ktime_t */
 	int r_attempts;
 	u32 r_map_dne_bound;
+	bool r_multi_data;                    /* reply data for several ops */
+	struct ceph_ec_split *r_ec_split;     /* EC split read in flight */
 
 	struct ceph_osd_req_op r_ops[] __counted_by(r_num_ops);
 };
 
 struct ceph_request_redirect {
 	struct ceph_object_locator oloc;
+	struct ceph_hobject_id *migration_wm;
 };
 
 /*
@@ -417,6 +432,12 @@ struct ceph_osd_client {
 	struct rb_root         linger_requests; /* lingering requests */
 	struct rb_root         map_checks;
 	struct rb_root         linger_map_checks;
+	struct rb_root         migration_wms; /* PG -> migration watermark */
+	bool                   ec_split_v1;   /* no GET_INTERNAL_VERSIONS_V2 */
+	atomic64_t             ec_direct_reads;
+	atomic64_t             ec_direct_eagain;
+	atomic64_t             ec_split_reads;
+	atomic64_t             ec_split_fallbacks;
 	atomic_t               num_requests;
 	atomic_t               num_homeless;
 	int                    abort_err;
