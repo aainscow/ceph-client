@@ -4,22 +4,25 @@
 
 # Kernel client port: test plan for a real machine
 
-Draft, updated 2026-11-12.  Covers the libceph series in this PR, on
+Draft, updated 2026-11-12 (v4).  Covers the libceph series in this PR, on
 ceph-client `testing` (7.4-rc2, which has the read_from_replica fix
-d6c7a5fcd088), in two parts; review changes reach it as FIXUP commits on
-top:
+d6c7a5fcd088): 30 patches, FIXUPs folded in, the large ones split for
+review:
 
-- Part A, needs only ceph.git main: SERVER_OCTOPUS..SERVER_VAMPIRE, pg_pool_t
-  up to v34, pg_upmap_primaries, primary-first pg_temp, EC optimizations as a
-  new interval, pool migration (routing, watermark redirects, linger moves),
-  multi-op reply data, CephFS version reads from the primary, EC direct reads
-  (single chunk, one-shot shard requests, split reads with
+- Part A, needs only ceph.git main (patches 1-20): SERVER_OCTOPUS..
+  SERVER_VAMPIRE, pg_pool_t up to v33 and v34, pg_upmap_primaries,
+  primary-first pg_temp, EC optimizations as a new interval, pool migration
+  (routing; watermark redirects; debugfs; linger moves), multi-op reply data,
+  CephFS version reads from the primary, the pool's tiering and dedup tier,
+  EC direct reads (single chunk, one-shot shard requests, split reads with
   GET_INTERNAL_VERSIONS_V2, or GET_INTERNAL_VERSIONS after an OSD refuses
   _V2).
-- Part B, waits for ceph PRs 72643 and 73794: bit 54 (OSD_STRETCH_ZONES /
-  POOL_MIGRATION), pg_pool_t v35 (num_zones), zone-aware direct reads.
-- KUnit tests (CONFIG_CEPH_LIB_KUNIT_TEST), and a DNM debugfs counters patch
-  used by the test harness, which stays out of the series.
+- Part B, waits for ceph PRs 72643 and 73794 (patches 21-24): bit 54
+  (OSD_STRETCH_ZONES / POOL_MIGRATION), pg_pool_t v35 (num_zones),
+  zone-aware direct reads.
+- KUnit tests (CONFIG_CEPH_LIB_KUNIT_TEST, patches 25-30, one per area),
+  and a DNM debugfs counters patch used by the test harness, which stays out
+  of the series.
 
 The local test scripts named below belong to a harness (qemu guests against a
 vstart cluster) that is not published yet.
@@ -175,6 +178,29 @@ regressions (9) and mixed releases.
      mon and OSD restarts, upgrade_cluster.sh), then runs chaos with
      migrations on single-zone pools (replicated, EC 4+2, EC 8+3, CephFS on
      EC 4+2).
+   Decisions (chaos fork, 2026-11-12 night, owner unavailable):
+   - A second cluster beside the main one (file-backed BlueStore, own
+     ports), so the main cluster's runs and repros go on undisturbed.
+   - librados probes read with policy none: balanced/localized librados
+     reads abort in Objecter on migration redirects (tracker 81981, fixed by
+     ceph PR 72977, which the tree lacks); the kernel clients are the
+     subject.
+   - Two-zone migrations name template pools' CRUSH rules and profiles: a
+     migrate from layout arguments alone reuses the source's rule and is
+     refused for another layout.  Two-zone EC stays 4+2 per zone (another
+     k needs a rule the monitors only allow with require_min_compat_client
+     vampire, which the migration workload's pool_migration setting
+     replaces).  EC -> EC with another k is covered in the single-zone run
+     (4+2 <-> 8+3).
+   - CephFS clients only in the single-zone runs (vstart's CephFS metadata
+     and data pools are single-zone, so zone failovers would just stall
+     them).
+   - Kernel: m04fix (PR head + the N3 fix) until main names the final
+     series' kernel; then the later runs use that.
+   - V1 check: the notice must appear at most once per libceph client (an
+     RBD map or a CephFS mount; fs-loop remounts every 5 cycles), split
+     reads must keep counting after it, and a client booted after the
+     upgrade must print none.
 
 ## 4a. Design decisions and the tests that cover them
 
@@ -194,6 +220,7 @@ regressions (9) and mixed releases.
 | Pools of size 0 are refused at decode, whatever the encoding (Bob's review item 4) | The zone helpers divide by the zone size | KUnit: pool_v35_test size-0 cases |
 | EC direct reads only from pools that allow non-primary reads as pg_pool_t::allows_nonprimary_reads(): not a tier, no tiers, no dedup tier; tier_of, tiers and the pool options' dedup tier are decoded for it. Replica reads of replicated pools are unchanged (mainline never checked) (Bob's review item 5, 2026-11-12) | Objecter parity | KUnit: ec_direct_read_pool_test, direct_read_tier_test |
 | Advertising SERVER_QUINCY makes monitors encode every CRUSH rule's sizes as 1..100, so rules match any pool size (Bob's review item 7: stated in the commit message) | CrushWrapper::encode() | KUnit: osdmap_crush_rule_size_test; VM: every suite maps pools of size 3-12 |
+| A request also follows the force resend epoch of the pool a migration sends it to, not only its base pool's (N4, chaos run S4, 2026-11-13) | libceph learns of PG merges only from that epoch (v25, last_force_op_resend_prenautilus, set at each merge step), and a migrated pool is merged in its target; the merge source's OSDs drop the requests and the merge target shares its OSDs, so nothing else resends | KUnit: migration_merge_test (fails without the fix); VM R1: merge a pool whose migration has finished (pg_num 32 -> 16) under KVM krbd writes, v3b (a request stays pending on a merged-away PG) vs v3c (requests move with each merge step, no stall) |
 | The debugfs counters patch stays out of the upstream series (DNM) | Style review: libceph debugfs shows state, not counters | Harness keeps reading EC_DIRECT_READS from test kernels only |
 | Part A and Part B are reviewed and tested separately | Part B depends on unmerged ceph PRs | Run the suites with a Part A kernel against a main-only build, and with A+B against the combined build |
 
